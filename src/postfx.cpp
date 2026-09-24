@@ -1375,31 +1375,24 @@ makeBlueNoise8x8(uint8 *out)
 		out[i] = (uint8)((v[i] * 255) / 63);
 }
 
-static void
-destroyBloomBuffers(void)
-{
-	if(bloomTextureA){ RwTextureDestroy(bloomTextureA); bloomTextureA = nil; }
-	if(bloomTextureB){ RwTextureDestroy(bloomTextureB); bloomTextureB = nil; }
-	if(bloomRasterA){ RwRasterDestroy(bloomRasterA); bloomRasterA = nil; }
-	if(bloomRasterB){ RwRasterDestroy(bloomRasterB); bloomRasterB = nil; }
-	bloomLastW = bloomLastH = 0;
-}
-
 static bool
 ensureBloomBuffers(int w, int h)
 {
 	if(bloomRasterA && bloomLastW == w && bloomLastH == h)
 		return true;
-	destroyBloomBuffers();
+	// envmap.cpp pattern: the RwTexture persists, only the raster is
+	// recreated and re-attached (RwTextureDestroy isn't wrapped)
+	if(!bloomTextureA){
+		bloomTextureA = RwTextureCreate(nil);
+		bloomTextureB = RwTextureCreate(nil);
+	}
+	if(bloomRasterA) RwRasterDestroy(bloomRasterA);
+	if(bloomRasterB) RwRasterDestroy(bloomRasterB);
 	int depth = CPostEffects::pRasterFrontBuffer->depth;
 	bloomRasterA = RwRasterCreate(w, h, depth, rwRASTERTYPECAMERATEXTURE);
 	bloomRasterB = RwRasterCreate(w, h, depth, rwRASTERTYPECAMERATEXTURE);
-	if(!bloomRasterA || !bloomRasterB){
-		destroyBloomBuffers();
+	if(!bloomRasterA || !bloomRasterB)
 		return false;
-	}
-	bloomTextureA = RwTextureCreate(nil);
-	bloomTextureB = RwTextureCreate(nil);
 	RwTextureSetRaster(bloomTextureA, bloomRasterA);
 	RwTextureSetRaster(bloomTextureB, bloomRasterB);
 	bloomLastW = w;
@@ -1417,8 +1410,9 @@ ensureDitherTexture(int w, int h)
 	int dh = (h + 7) / 8;
 	if(ditherRaster && ditherLastW == w && ditherLastH == h)
 		return true;
-	if(ditherTexture){ RwTextureDestroy(ditherTexture); ditherTexture = nil; }
-	if(ditherRaster){ RwRasterDestroy(ditherRaster); ditherRaster = nil; }
+	if(!ditherTexture)
+		ditherTexture = RwTextureCreate(nil);
+	if(ditherRaster) RwRasterDestroy(ditherRaster);
 	ditherRaster = RwRasterCreate(dw, dh, 32, rwRASTERTYPECAMERATEXTURE);
 	if(!ditherRaster)
 		return false;
@@ -1434,7 +1428,6 @@ ensureDitherTexture(int w, int h)
 			*pixels++ = 0xFF;
 		}
 	RwRasterUnlock(ditherRaster);
-	ditherTexture = RwTextureCreate(nil);
 	RwTextureSetRaster(ditherTexture, ditherRaster);
 	ditherLastW = w;
 	ditherLastH = h;
