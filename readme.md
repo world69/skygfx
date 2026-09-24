@@ -23,3 +23,13 @@ For example:
     RWSDK36: <some path>\RWSDK\RW36\Graphics\rwsdk\include\d3d9
 
 Use premake to generate a solution.
+
+----------
+
+How to configure:
+Copy [skygfx.example.ini](skygfx.example.ini) next to `skygfx.asi` in your GTA San Andreas folder, rename it to `skygfx.ini`, and adjust the values you need. Every option, with its default, is documented in that file.
+
+Presets: put multiple configs in the same folder as `skygfx1.ini` ... `skygfx9.ini`. With a `keySwitch` scancode set in the active config, that key cycles through the presets in-game (see the sample file for the scancode table). A `keyReload` scancode reloads all configs without restarting.
+
+New in this fork:
+- Screen FX pass: bloom, exposure + filmic tone map, and PS2-style 15-bit dithering — see the `[SkyGfx]` "screen fx" section in the sample config (all off by default).

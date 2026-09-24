@@ -1400,6 +1400,19 @@ ensureBloomBuffers(int w, int h)
 	return true;
 }
 
+// Render targets are switched the way the proven Radiosity_shader code does
+// it: by swapping the camera raster. Never point RwD3D9SetRenderTarget at the
+// camera raster itself - in this RW build its D3D render target surface is
+// managed by the game, not the raster, and that code path dereferences a NULL
+// surface (access violation inside RwD3D9SetRenderTarget, reported by users).
+static void
+setSceneRaster(RwRaster *r)
+{
+	RwCameraEndUpdate(Scene.camera);
+	RwCameraSetRaster(Scene.camera, r);
+	RwCameraBeginUpdate(Scene.camera);
+}
+
 // dither pattern: one 8x8 blue noise tile per 8x8 screen pixels, so sampling
 // the raster with screen-space UVs gives per-pixel noise without any extra
 // constants or texture transforms
@@ -1458,6 +1471,10 @@ CPostEffects::DrawFinalEffects(void)
 	if(doDither && !ensureDitherTexture(w, h))
 		doDither = false;
 
+	RwRaster *drawBuffer = RwCameraGetRaster(Scene.camera);
+	if(drawBuffer == nil)
+		return;
+
 	// scene, after all game post effects, into the front buffer
 	UpdateFrontBuffer();
 
@@ -1468,14 +1485,13 @@ CPostEffects::DrawFinalEffects(void)
 	RwRenderStateSet(rwRENDERSTATEVERTEXALPHAENABLE, (void*)FALSE);
 	RwD3D9SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
 
-	RwRaster *drawBuffer = RwCameraGetRaster(Scene.camera);
-
 	// ---- bloom: bright pass + separable blur iterations, ping-pong A/B ----
+	// Each (vertical, horizontal) pair starts and ends in `src`, so after every
+	// iteration `src` holds the newest result - no pointer swapping needed.
 	RwRaster *bloomResult = nil;
 	RwTexture *bloomResultTex = nil;
 	if(doBloom){
 		RwRaster *src, *dst;
-		RwTexture *srcTex, *dstTex;
 		float th[4];
 		float off[4];
 		float invw = 1.0f / w;
@@ -1487,42 +1503,40 @@ CPostEffects::DrawFinalEffects(void)
 		th[1] = th[2] = th[3] = 0.0f;
 		RwD3D9SetPixelShaderConstant(0, th, 1);
 		RwRenderStateSet(rwRENDERSTATETEXTURERASTER, (void*)pRasterFrontBuffer);
-		RwD3D9SetRenderTarget(0, bloomRasterA);
+		setSceneRaster(bloomRasterA);
 		overrideIm2dPixelShader = brightPS;
 		RwIm2DRenderIndexedPrimitive(rwPRIMTYPETRILIST, colorfilterVerts, 4, colorfilterIndices, 6);
 		overrideIm2dPixelShader = nil;
 
 		src = bloomRasterA; dst = bloomRasterB;
-		srcTex = bloomTextureA; dstTex = bloomTextureB;
 		for(i = 0; i < config->bloomIterations; i++){
-			// vertical
+			// vertical: read src, write dst
 			off[0] = 0.0f; off[1] = invh; off[2] = off[3] = 0.0f;
 			RwD3D9SetPixelShaderConstant(0, off, 1);
 			RwRenderStateSet(rwRENDERSTATETEXTURERASTER, (void*)src);
-			RwD3D9SetRenderTarget(0, dst);
+			setSceneRaster(dst);
 			overrideIm2dPixelShader = bloomBlurPS;
 			RwIm2DRenderIndexedPrimitive(rwPRIMTYPETRILIST, colorfilterVerts, 4, colorfilterIndices, 6);
 			overrideIm2dPixelShader = nil;
-			// horizontal
+			// horizontal: read dst, write back to src
 			off[0] = invw; off[1] = 0.0f;
 			RwD3D9SetPixelShaderConstant(0, off, 1);
 			RwRenderStateSet(rwRENDERSTATETEXTURERASTER, (void*)dst);
-			RwD3D9SetRenderTarget(0, src);
+			setSceneRaster(src);
 			overrideIm2dPixelShader = bloomBlurPS;
 			RwIm2DRenderIndexedPrimitive(rwPRIMTYPETRILIST, colorfilterVerts, 4, colorfilterIndices, 6);
 			overrideIm2dPixelShader = nil;
-			{
-				RwRaster *tr = src; src = dst; dst = tr;
-				RwTexture *tt = srcTex; srcTex = dstTex; dstTex = tt;
-			}
 		}
+		// each (vertical, horizontal) pair ends in src, so src holds the
+		// newest result after the last iteration
 		bloomResult = src;
-		bloomResultTex = srcTex;
+		bloomResultTex = bloomTextureA;
 	}
 
 	// ---- final composite: scene (+bloom), exposure, tone map, grading, dither ----
+	if(doBloom)
+		setSceneRaster(drawBuffer); // restore the scene raster as render target
 	RwRenderStateSet(rwRENDERSTATETEXTUREFILTER, (void*)rwFILTERNEAREST);
-	RwD3D9SetRenderTarget(0, drawBuffer);
 	RwRenderStateSet(rwRENDERSTATETEXTURERASTER, (void*)pRasterFrontBuffer);
 
 	// grading matrix: YCbCr tweak, or identity when it's not enabled
