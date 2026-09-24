@@ -33,6 +33,18 @@ jobs:
     - name: Add MSBuild to PATH
       uses: microsoft/setup-msbuild@v2
     
+    - name: Compile postfx shaders
+      shell: pwsh
+      run: |
+        $fxc = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Bin" -Recurse -Filter "fxc.exe" -ErrorAction SilentlyContinue |
+               Where-Object { $_.FullName -like "*\x86\fxc.exe" } |
+               Select-Object -First 1
+        if (-not $fxc) { throw "fxc.exe not found in Windows Kits" }
+        foreach ($shader in @("brightPS", "bloomBlurPS", "finalPS")) {
+          & $fxc.FullName /T ps_2_a /nologo /E main "shaders/ps/${shader}.hlsl" /Fo "resources/cso/${shader}.cso"
+          if ($LASTEXITCODE -ne 0) { throw "fxc failed for ${shader}.hlsl" }
+        }
+    
     - name: Build
       run: |
         .\premake5.exe vs2022

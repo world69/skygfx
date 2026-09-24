@@ -1129,6 +1129,19 @@ readIni(int n)
 	c->envMapSize = i;
 	c->envMapFarClipMult = readfloat(cfg.get("SkyGfx", "envMapFarClipMult", ""), 1.0);
 	c->envMapUseLODs = readint(cfg.get("SkyGfx", "envMapUseLODs", ""), 0);
+
+	c->doBloom = readint(cfg.get("SkyGfx", "doBloom", ""), 0);
+	c->bloomIntensity = readfloat(cfg.get("SkyGfx", "bloomIntensity", ""), 0.5f);
+	c->bloomThreshold = readfloat(cfg.get("SkyGfx", "bloomThreshold", ""), 0.7f);
+	c->bloomIterations = readint(cfg.get("SkyGfx", "bloomIterations", ""), 2);
+	if(c->bloomIterations < 1) c->bloomIterations = 1;
+	if(c->bloomIterations > 3) c->bloomIterations = 3;
+	c->exposure = readfloat(cfg.get("SkyGfx", "exposure", ""), 1.0f);
+	if(c->exposure < 0.0f) c->exposure = 0.0f;
+	c->doToneMap = readint(cfg.get("SkyGfx", "doToneMap", ""), 0);
+	c->whitePoint = readfloat(cfg.get("SkyGfx", "whitePoint", ""), 1.0f);
+	if(c->whitePoint < 0.1f) c->whitePoint = 0.1f;
+	c->ps2Dither = readint(cfg.get("SkyGfx", "ps2Dither", ""), 0);
 	c->doglare = readint(cfg.get("SkyGfx", "sunGlare", ""), -1);
 	if(c->doglare < 0){
 		iCanHasSunGlare = false;
@@ -1348,9 +1361,17 @@ afterStreamIni(void)
 	X(crOffset)				\
 	X(rgb1Mult)				\
 	X(rgb2Mult)				\
-	X(envMapSize)			\
-	X(envMapUseLODs)			\
-	X(envMapFarClipMult)
+	X(envMapSize)		\
+	X(envMapUseLODs)	\
+	X(envMapFarClipMult)	\
+	X(doBloom)			\
+	X(bloomIntensity)	\
+	X(bloomThreshold)	\
+	X(bloomIterations)	\
+	X(exposure)			\
+	X(doToneMap)			\
+	X(whitePoint)		\
+	X(ps2Dither)
 
 struct SkyGfxMenu
 {
@@ -1517,6 +1538,14 @@ installMenu(void)
 		menu.rgb1Mult = DebugMenuAddVar("SkyGFX|Advanced", "RGB1 Mult", &config->rgb1Mult, resetValues, 1.0f, 0.0f, 10.0f);
 		menu.rgb2Mult = DebugMenuAddVar("SkyGFX|Advanced", "RGB2 Mult", &config->rgb2Mult, resetValues, 1.0f, 0.0f, 10.0f);
 
+		menu.doBloom = DebugMenuAddVarBool32("SkyGFX|ScreenFX", "Bloom", &config->doBloom, nil);
+		menu.bloomIntensity = DebugMenuAddVar("SkyGFX|ScreenFX", "Bloom Intensity", &config->bloomIntensity, nil, 0.05f, 0.0f, 2.0f);
+		menu.bloomThreshold = DebugMenuAddVar("SkyGFX|ScreenFX", "Bloom Threshold", &config->bloomThreshold, nil, 0.05f, 0.0f, 1.0f);
+		menu.bloomIterations = DebugMenuAddVar("SkyGFX|ScreenFX", "Bloom Blur Passes", &config->bloomIterations, nil, 1, 1, 3, nil);
+		menu.exposure = DebugMenuAddVar("SkyGFX|ScreenFX", "Exposure", &config->exposure, nil, 0.05f, 0.0f, 4.0f);
+		menu.doToneMap = DebugMenuAddVarBool32("SkyGFX|ScreenFX", "Filmic Tone Map", &config->doToneMap, nil);
+		menu.whitePoint = DebugMenuAddVar("SkyGFX|ScreenFX", "Tone Map White Point", &config->whitePoint, nil, 0.1f, 0.1f, 8.0f);
+		menu.ps2Dither = DebugMenuAddVarBool32("SkyGFX|ScreenFX", "PS2 Dithering (15-bit)", &config->ps2Dither, nil);
 		menu.bYCbCrFilter = DebugMenuAddVarBool8("SkyGFX|ScreenFX", "Enable YCbCr tweak", (int8_t*)&config->bYCbCrFilter, resetValues);
 		menu.lumaScale    = DebugMenuAddVar("SkyGFX|ScreenFX", "Y scale", &config->lumaScale, resetValues, 0.004f, 0.0f, 10.0f);
 		menu.lumaOffset   = DebugMenuAddVar("SkyGFX|ScreenFX", "Y offset", &config->lumaOffset, resetValues, 0.004f, -1.0f, 1.0f);

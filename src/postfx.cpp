@@ -1324,68 +1324,275 @@ static RwMatrix YUV2RGB = {
 	{  0.000f,	 0.000f,	 0.000f }, 0,
 };
 
+////
+//// Bloom / exposure / tone map / PS2 dither
+////
+
+void *brightPS, *bloomBlurPS, *finalPS;
+
+RwRaster *bloomRasterA, *bloomRasterB;
+RwTexture *bloomTextureA, *bloomTextureB;
+RwRaster *ditherRaster;
+RwTexture *ditherTexture;
+static int bloomLastW, bloomLastH, ditherLastW, ditherLastH;
+
+static uint32 ditherRngState = 0x12345678;
+static uint32
+ditherRng(void)
+{
+	ditherRngState ^= ditherRngState << 13;
+	ditherRngState ^= ditherRngState >> 17;
+	ditherRngState ^= ditherRngState << 5;
+	return ditherRngState;
+}
+
+// 8x8 blue noise via Munch's algorithm: start from a random permutation and
+// repeatedly swap the value closest to the mean with the one farthest from it
+static void
+makeBlueNoise8x8(uint8 *out)
+{
+	uint8 v[64];
+	int i;
+	for(i = 0; i < 64; i++)
+		v[i] = (uint8)i;
+	for(i = 63; i > 0; i--){
+		int j = ditherRng() % (i + 1);
+		uint8 t = v[i]; v[i] = v[j]; v[j] = t;
+	}
+	for(int iter = 0; iter < 4096; iter++){
+		int iclose = 0, ifar = 0;
+		float dclose = 1e9f, dfar = -1e9f;
+		for(i = 0; i < 64; i++){
+			float d = fabsf((float)v[i] - 31.5f);
+			if(d < dclose){ dclose = d; iclose = i; }
+			if(d > dfar){ dfar = d; ifar = i; }
+		}
+		if(iclose != ifar){
+			uint8 t = v[iclose]; v[iclose] = v[ifar]; v[ifar] = t;
+		}
+	}
+	for(i = 0; i < 64; i++)
+		out[i] = (uint8)((v[i] * 255) / 63);
+}
+
+static bool
+ensureBloomBuffers(int w, int h)
+{
+	if(bloomRasterA && bloomLastW == w && bloomLastH == h)
+		return true;
+	// envmap.cpp pattern: the RwTexture persists, only the raster is
+	// recreated and re-attached (RwTextureDestroy isn't wrapped)
+	if(!bloomTextureA){
+		bloomTextureA = RwTextureCreate(nil);
+		bloomTextureB = RwTextureCreate(nil);
+	}
+	if(bloomRasterA) RwRasterDestroy(bloomRasterA);
+	if(bloomRasterB) RwRasterDestroy(bloomRasterB);
+	int depth = CPostEffects::pRasterFrontBuffer->depth;
+	bloomRasterA = RwRasterCreate(w, h, depth, rwRASTERTYPECAMERATEXTURE);
+	bloomRasterB = RwRasterCreate(w, h, depth, rwRASTERTYPECAMERATEXTURE);
+	if(!bloomRasterA || !bloomRasterB)
+		return false;
+	RwTextureSetRaster(bloomTextureA, bloomRasterA);
+	RwTextureSetRaster(bloomTextureB, bloomRasterB);
+	bloomLastW = w;
+	bloomLastH = h;
+	return true;
+}
+
+// dither pattern: one 8x8 blue noise tile per 8x8 screen pixels, so sampling
+// the raster with screen-space UVs gives per-pixel noise without any extra
+// constants or texture transforms
+static bool
+ensureDitherTexture(int w, int h)
+{
+	int dw = (w + 7) / 8;
+	int dh = (h + 7) / 8;
+	if(ditherRaster && ditherLastW == w && ditherLastH == h)
+		return true;
+	if(!ditherTexture)
+		ditherTexture = RwTextureCreate(nil);
+	if(ditherRaster) RwRasterDestroy(ditherRaster);
+	ditherRaster = RwRasterCreate(dw, dh, 32, rwRASTERTYPECAMERATEXTURE);
+	if(!ditherRaster)
+		return false;
+	uint8 noise[64];
+	makeBlueNoise8x8(noise);
+	RwUInt8 *pixels = RwRasterLock(ditherRaster, 0, 1);
+	for(int y = 0; y < dh; y++)
+		for(int x = 0; x < dw; x++){
+			uint8 v = noise[(y & 7) * 8 + (x & 7)];
+			*pixels++ = v;
+			*pixels++ = v;
+			*pixels++ = v;
+			*pixels++ = 0xFF;
+		}
+	RwRasterUnlock(ditherRaster);
+	RwTextureSetRaster(ditherTexture, ditherRaster);
+	ditherLastW = w;
+	ditherLastH = h;
+	return true;
+}
+
 void
 CPostEffects::DrawFinalEffects(void)
 {
-	if(!m_bYCbCrFilter)
+	bool doYCbCr = m_bYCbCrFilter;
+	bool doBloom = config->doBloom;
+	bool doToneMap = config->doToneMap;
+	bool doDither = config->ps2Dither;
+	float exposure = config->exposure;
+
+	if(!doYCbCr && !doBloom && !doToneMap && !doDither && exposure == 1.0f)
+		return;
+	if(finalPS == nil)
 		return;
 
+	int w = RwRasterGetWidth(pRasterFrontBuffer);
+	int h = RwRasterGetHeight(pRasterFrontBuffer);
+	if(w <= 0 || h <= 0)
+		return;
+
+	if(doBloom && !ensureBloomBuffers(w, h))
+		doBloom = false;
+	if(doDither && !ensureDitherTexture(w, h))
+		doDither = false;
+
+	// scene, after all game post effects, into the front buffer
 	UpdateFrontBuffer();
 
-	RwRenderStateSet(rwRENDERSTATETEXTUREFILTER, (void*)rwFILTERNEAREST);
+	RwRenderStateSet(rwRENDERSTATETEXTUREFILTER, (void*)rwFILTERLINEAR);
 	RwRenderStateSet(rwRENDERSTATEFOGENABLE, (void*)FALSE);
 	RwRenderStateSet(rwRENDERSTATEZTESTENABLE, (void*)FALSE);
 	RwRenderStateSet(rwRENDERSTATEZWRITEENABLE, (void*)FALSE);
-	RwRenderStateSet(rwRENDERSTATETEXTURERASTER, (void*)CPostEffects::pRasterFrontBuffer);
 	RwRenderStateSet(rwRENDERSTATEVERTEXALPHAENABLE, (void*)FALSE);
+	RwD3D9SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
 
-	RwMatrix m = RGB2YUV;
+	RwRaster *drawBuffer = RwCameraGetRaster(Scene.camera);
 
-	RwMatrix m2;
-	m2.right.x = m_lumaScale;
-	m2.up.x = 0.0f;
-	m2.at.x = 0.0f;
-	m2.pos.x = m_lumaOffset;
-	m2.right.y = 0.0f;
-	m2.up.y = m_cbScale;
-	m2.at.y = 0.0f;
-	m2.pos.y = m_cbOffset;
-	m2.right.z = 0.0f;
-	m2.up.z = 0.0f;
-	m2.at.z = m_crScale;
-	m2.pos.z = m_crOffset;
+	// ---- bloom: bright pass + separable blur iterations, ping-pong A/B ----
+	RwRaster *bloomResult = nil;
+	RwTexture *bloomResultTex = nil;
+	if(doBloom){
+		RwRaster *src, *dst;
+		RwTexture *srcTex, *dstTex;
+		float th[4];
+		float off[4];
+		float invw = 1.0f / w;
+		float invh = 1.0f / h;
+		int i;
 
-	RwMatrixOptimize(&m2, nil);
+		// bright pass: front buffer -> A
+		th[0] = config->bloomThreshold;
+		th[1] = th[2] = th[3] = 0.0f;
+		RwD3D9SetPixelShaderConstant(0, th, 1);
+		RwRenderStateSet(rwRENDERSTATETEXTURERASTER, (void*)pRasterFrontBuffer);
+		RwD3D9SetRenderTarget(0, bloomRasterA);
+		overrideIm2dPixelShader = brightPS;
+		RwIm2DRenderIndexedPrimitive(rwPRIMTYPETRILIST, colorfilterVerts, 4, colorfilterIndices, 6);
+		overrideIm2dPixelShader = nil;
 
-	RwMatrixTransform(&m, &m2, rwCOMBINEPOSTCONCAT);
-	RwMatrixTransform(&m, &YUV2RGB, rwCOMBINEPOSTCONCAT);
+		src = bloomRasterA; dst = bloomRasterB;
+		srcTex = bloomTextureA; dstTex = bloomTextureB;
+		for(i = 0; i < config->bloomIterations; i++){
+			// vertical
+			off[0] = 0.0f; off[1] = invh; off[2] = off[3] = 0.0f;
+			RwD3D9SetPixelShaderConstant(0, off, 1);
+			RwRenderStateSet(rwRENDERSTATETEXTURERASTER, (void*)src);
+			RwD3D9SetRenderTarget(0, dst);
+			overrideIm2dPixelShader = bloomBlurPS;
+			RwIm2DRenderIndexedPrimitive(rwPRIMTYPETRILIST, colorfilterVerts, 4, colorfilterIndices, 6);
+			overrideIm2dPixelShader = nil;
+			// horizontal
+			off[0] = invw; off[1] = 0.0f;
+			RwD3D9SetPixelShaderConstant(0, off, 1);
+			RwRenderStateSet(rwRENDERSTATETEXTURERASTER, (void*)dst);
+			RwD3D9SetRenderTarget(0, src);
+			overrideIm2dPixelShader = bloomBlurPS;
+			RwIm2DRenderIndexedPrimitive(rwPRIMTYPETRILIST, colorfilterVerts, 4, colorfilterIndices, 6);
+			overrideIm2dPixelShader = nil;
+			{
+				RwRaster *tr = src; src = dst; dst = tr;
+				RwTexture *tt = srcTex; srcTex = dstTex; dstTex = tt;
+			}
+		}
+		bloomResult = src;
+		bloomResultTex = srcTex;
+	}
+
+	// ---- final composite: scene (+bloom), exposure, tone map, grading, dither ----
+	RwRenderStateSet(rwRENDERSTATETEXTUREFILTER, (void*)rwFILTERNEAREST);
+	RwD3D9SetRenderTarget(0, drawBuffer);
+	RwRenderStateSet(rwRENDERSTATETEXTURERASTER, (void*)pRasterFrontBuffer);
+
+	// grading matrix: YCbCr tweak, or identity when it's not enabled
 	Grade red, green, blue;
-	red.r = m.right.x;
-	red.g = m.up.x;
-	red.b = m.at.x;
-	red.a = m.pos.x;
-	green.r = m.right.y;
-	green.g = m.up.y;
-	green.b = m.at.y;
-	green.a = m.pos.y;
-	blue.r = m.right.z;
-	blue.g = m.up.z;
-	blue.b = m.at.z;
-	blue.a = m.pos.z;
+	if(doYCbCr){
+		RwMatrix m = RGB2YUV;
+		RwMatrix m2;
+		m2.right.x = m_lumaScale;
+		m2.up.x = 0.0f;
+		m2.at.x = 0.0f;
+		m2.pos.x = m_lumaOffset;
+		m2.right.y = 0.0f;
+		m2.up.y = m_cbScale;
+		m2.at.y = 0.0f;
+		m2.pos.y = m_cbOffset;
+		m2.right.z = 0.0f;
+		m2.up.z = 0.0f;
+		m2.at.z = m_crScale;
+		m2.pos.z = m_crOffset;
 
+		RwMatrixOptimize(&m2, nil);
+
+		RwMatrixTransform(&m, &m2, rwCOMBINEPOSTCONCAT);
+		RwMatrixTransform(&m, &YUV2RGB, rwCOMBINEPOSTCONCAT);
+		red.r = m.right.x;
+		red.g = m.up.x;
+		red.b = m.at.x;
+		red.a = m.pos.x;
+		green.r = m.right.y;
+		green.g = m.up.y;
+		green.b = m.at.y;
+		green.a = m.pos.y;
+		blue.r = m.right.z;
+		blue.g = m.up.z;
+		blue.b = m.at.z;
+		blue.a = m.pos.z;
+	}else{
+		red.r = 1.0f; red.g = red.b = red.a = 0.0f;
+		green.g = 1.0f; green.r = green.b = green.a = 0.0f;
+		blue.b = 1.0f; blue.r = blue.g = blue.a = 0.0f;
+	}
 	RwD3D9SetPixelShaderConstant(0, &red, 1);
 	RwD3D9SetPixelShaderConstant(1, &green, 1);
 	RwD3D9SetPixelShaderConstant(2, &blue, 1);
 
-	overrideIm2dPixelShader = gradingPS;
+	{
+		float params[4];
+		params[0] = exposure;
+		params[1] = doToneMap ? config->whitePoint : 0.0f;
+		params[2] = bloomResult ? config->bloomIntensity : 0.0f;
+		params[3] = doDither ? 1.0f : 0.0f;
+		RwD3D9SetPixelShaderConstant(3, params, 1);
+	}
+
+	RwD3D9SetTexture(bloomResultTex, 1);
+	RwD3D9SetTexture(doDither ? ditherTexture : nil, 2);
+
+	overrideIm2dPixelShader = finalPS;
 	RwIm2DRenderIndexedPrimitive(rwPRIMTYPETRILIST, colorfilterVerts, 4, colorfilterIndices, 6);
 	overrideIm2dPixelShader = nil;
+
+	RwD3D9SetTexture(nil, 1);
+	RwD3D9SetTexture(nil, 2);
 
 	RwRenderStateSet(rwRENDERSTATETEXTUREFILTER, (void*)rwFILTERLINEAR);
 	RwRenderStateSet(rwRENDERSTATEZTESTENABLE, (void*)TRUE);
 	RwRenderStateSet(rwRENDERSTATEZWRITEENABLE, (void*)TRUE);
 	RwRenderStateSet(rwRENDERSTATETEXTURERASTER, (void*)NULL);
 	RwRenderStateSet(rwRENDERSTATEVERTEXALPHAENABLE, (void*)TRUE);
+	RwD3D9SetRenderState(D3DRS_ALPHATESTENABLE, TRUE);
 }
 
 void (*CPostEffects::Initialise_orig)(void);

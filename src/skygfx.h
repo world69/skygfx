@@ -125,6 +125,16 @@ struct Config {
 	float envSpecularityMult;
 	float envPower;
 	float envFresnel;
+
+	// screen fx
+	int doBloom;
+	float bloomIntensity;
+	float bloomThreshold;
+	int bloomIterations;
+	float exposure;
+	int doToneMap;
+	float whitePoint;
+	int ps2Dither;
 };
 extern int numConfigs;
 extern int currentConfig;
@@ -324,6 +334,7 @@ extern void *mobileVehiclePipeVS, *mobileVehiclePipePS;
 extern void *iiiTrailsPS, *vcTrailsPS;
 extern void *gradingPS, *contrastPS;
 extern void *blurPS, *radiosityPS;
+extern void *brightPS, *bloomBlurPS, *finalPS;
 // building
 extern void *ps2BuildingVS, *ps2BuildingFxVS;
 extern void *xboxBuildingVS, *xboxBuildingPS, *xboxBuildingStochasticPS;

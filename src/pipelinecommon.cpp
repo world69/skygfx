@@ -353,6 +353,9 @@ CreateShaders(void)
 	makePS(IDR_CONTRASTPS, &contrastPS);
 	makePS(IDR_BLURPS, &blurPS);
 	makePS(IDR_RADIOSITYPS, &radiosityPS);
+	makePS(IDR_BRIGHTPS, &brightPS);
+	makePS(IDR_BLOOMBLURPS, &bloomBlurPS);
+	makePS(IDR_FINALPS, &finalPS);
 
 	makePS(IDR_SIMPLEPS, &simplePS);
 	makePS(IDR_SIMPLESTOCHASTICPS, &simpleStochasticPS);
