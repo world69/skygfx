@@ -808,6 +808,7 @@ WRAPPER void RenderScene(void) { VARJMP(RenderScene_A); }
 void RenderReflectionMap_leeds(void);
 void RenderReflectionScene(void);
 void DrawDebugEnvMap(void);
+void RenderScale_Begin(void);
 
 bool
 RenderScene_before(void*)
@@ -822,6 +823,9 @@ RenderScene_before(void*)
 	float modifierY = freq + (freq * CWeather__WindDir.y);
 	windPos.x += modifierX * CTimer__ms_fTimeStep;
 	windPos.y += modifierY * CTimer__ms_fTimeStep;
+
+	// low-res scene target (see RenderScale_Begin in postfx.cpp)
+	RenderScale_Begin();
 
 	return true;
 }
@@ -1142,6 +1146,16 @@ readIni(int n)
 	c->whitePoint = readfloat(cfg.get("SkyGfx", "whitePoint", ""), 1.0f);
 	if(c->whitePoint < 0.1f) c->whitePoint = 0.1f;
 	c->ps2Dither = readint(cfg.get("SkyGfx", "ps2Dither", ""), 0);
+	c->doAutoExposure = readint(cfg.get("SkyGfx", "doAutoExposure", ""), 0);
+	c->autoExposureGain = readfloat(cfg.get("SkyGfx", "autoExposureGain", ""), 0.8f);
+	c->bloomNightBoost = readfloat(cfg.get("SkyGfx", "bloomNightBoost", ""), 0.0f);
+	c->vignetteStrength = readfloat(cfg.get("SkyGfx", "vignetteStrength", ""), 0.0f);
+	c->chromaticAberration = readfloat(cfg.get("SkyGfx", "chromaticAberration", ""), 0.0f);
+	c->ps2Grain = readint(cfg.get("SkyGfx", "ps2Grain", ""), 0);
+	c->ps2GrainStrength = readfloat(cfg.get("SkyGfx", "ps2GrainStrength", ""), 0.3f);
+	c->renderScale = readfloat(cfg.get("SkyGfx", "renderScale", ""), 1.0f);
+	if(c->renderScale < 0.5f) c->renderScale = 0.5f;
+	if(c->renderScale > 1.0f) c->renderScale = 1.0f;
 	c->doglare = readint(cfg.get("SkyGfx", "sunGlare", ""), -1);
 	if(c->doglare < 0){
 		iCanHasSunGlare = false;
@@ -1613,6 +1627,12 @@ InjectDelayedPatches()
 	// don't assign building pipe just because a model has two sets of prelight
 	// or when it already has a pipeline
 	explicitBuildingPipe = explicitBuildingPipe_tmp;
+
+	// Disable custom building/vehicle pipelines if ProperShaders is present (conflict)
+	if(ModuleList().Get(L"ProperShaders")){
+		iCanHasbuildingPipe = false;
+		iCanHasvehiclePipe = false;
+	}
 
 	// custom building pipeline
 	if(iCanHasbuildingPipe)

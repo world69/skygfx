@@ -33,3 +33,4 @@ Presets: put multiple configs in the same folder as `skygfx1.ini` ... `skygfx9.i
 
 New in this fork:
 - Screen FX pass: bloom, exposure + filmic tone map, and PS2-style 15-bit dithering — see the `[SkyGfx]` "screen fx" section in the sample config (all off by default).
+- Screen FX 2: auto exposure (night-aware, smoothed), night bloom boost, vignette, subtle chromatic aberration, PS2-style grain + 2px scanlines, and `renderScale` (internal resolution — experimental, off by default). All documented in the "screen fx 2" section of the sample config.

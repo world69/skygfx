@@ -1447,6 +1447,122 @@ ensureDitherTexture(int w, int h)
 	return true;
 }
 
+////
+//// Screen FX 2: PS2 grain+scanlines, auto exposure, night bloom boost,
+//// renderScale (internal resolution)
+////
+
+// 128x128 texture with a per-pixel grain and a 2px scanline pattern pre-baked:
+// g in [-1,1] = (noise-0.5)*1.2 (grain, range [-0.6, 0.6])
+//               + (row%2 ? -0.5 : 0) (scanline darkens every other 2px row)
+// stored as (g+1)/2 in 8-bit. 128 is even, so tiling keeps the 2px row parity
+// aligned on screen at any resolution.
+RwRaster *sfxGrainRaster;
+RwTexture *sfxGrainTexture;
+static int sfxGrainLastW, sfxGrainLastH;
+
+// PS2-style grain + 2px scanlines, baked per screen pixel (same pattern as
+// the dither texture: full screen size, rebuilt on resolution change).
+static uint32 sfxGrainRng = 0x9E3779B9;
+static uint32
+sfxGrainRngNext(void)
+{
+	sfxGrainRng ^= sfxGrainRng << 13;
+	sfxGrainRng ^= sfxGrainRng >> 17;
+	sfxGrainRng ^= sfxGrainRng << 5;
+	return sfxGrainRng;
+}
+
+static bool
+ensureSfxGrainTexture(int w, int h)
+{
+	if(sfxGrainRaster && sfxGrainLastW == w && sfxGrainLastH == h)
+		return true;
+	if(!sfxGrainTexture)
+		sfxGrainTexture = RwTextureCreate(nil);
+	if(sfxGrainRaster) RwRasterDestroy(sfxGrainRaster);
+	sfxGrainRaster = RwRasterCreate(w, h, 32, rwRASTERTYPECAMERATEXTURE);
+	if(!sfxGrainRaster)
+		return false;
+	sfxGrainRng = 0x9E3779B9;
+	uint8 *px = RwRasterLock(sfxGrainRaster, 0, 1);
+	for(int y = 0; y < h; y++)
+		for(int x = 0; x < w; x++){
+			float n = (float)((sfxGrainRngNext() >> 8) & 0xFF) / 255.0f;
+			float g = (n - 0.5f) * 1.2f;
+			if(y & 1)
+				g -= 0.5f;
+			if(g < -1.0f) g = -1.0f;
+			if(g > 1.0f) g = 1.0f;
+			uint8 v = (uint8)((g + 1.0f) * 0.5f * 255.0f + 0.5f);
+			*px++ = v;
+			*px++ = v;
+			*px++ = v;
+			*px++ = 0xFF;
+		}
+	RwRasterUnlock(sfxGrainRaster);
+	RwTextureSetRaster(sfxGrainTexture, sfxGrainRaster);
+	sfxGrainLastW = w;
+	sfxGrainLastH = h;
+	return true;
+}
+
+// renderScale: render the scene into a smaller camera texture and upscale it
+// in the final composite (softer PS2-like look + fewer scene pixels).
+// RenderScale_Begin() is called from RenderScene_before() in main.cpp before
+// the scene is drawn; DrawFinalEffects() draws to the original raster again.
+RwRaster *scaleRaster;
+RwTexture *scaleTexture;
+RwRaster *scaleSavedRaster;
+static int scaleLastW, scaleLastH, scaleLastDepth;
+
+static RwRaster *
+ensureScaleRaster(int w, int h, RwInt32 depth)
+{
+	if(scaleRaster && scaleLastW == w && scaleLastH == h && scaleLastDepth == depth)
+		return scaleRaster;
+	if(scaleTexture == nil)
+		scaleTexture = RwTextureCreate(nil);
+	if(scaleRaster)
+		RwRasterDestroy(scaleRaster);
+	scaleRaster = RwRasterCreate(w, h, depth, rwRASTERTYPECAMERATEXTURE);
+	if(!scaleRaster)
+		return nil;
+	scaleLastW = w;
+	scaleLastH = h;
+	scaleLastDepth = depth;
+	RwTextureSetRaster(scaleTexture, scaleRaster);
+	return scaleRaster;
+}
+
+void
+RenderScale_Begin(void)
+{
+	float s = config->renderScale;
+	if(s < 0.5f)
+		s = 0.5f;
+	if(s >= 1.0f){
+		scaleSavedRaster = nil;
+		return;
+	}
+	RwRaster *camR = RwCameraGetRaster(Scene.camera);
+	if(camR == nil || camR->width < 64 || camR->height < 64){
+		scaleSavedRaster = nil;
+		return;
+	}
+	int w = ((int)(camR->width * s) + 1) & ~1;
+	int h = ((int)(camR->height * s) + 1) & ~1;
+	if(w > camR->width) w = camR->width & ~1;
+	if(h > camR->height) h = camR->height & ~1;
+	RwRaster *sr = ensureScaleRaster(w, h, camR->depth);
+	if(sr == nil){
+		scaleSavedRaster = nil;
+		return;
+	}
+	scaleSavedRaster = camR;
+	setSceneRaster(sr);
+}
+
 void
 CPostEffects::DrawFinalEffects(void)
 {
@@ -1456,7 +1572,24 @@ CPostEffects::DrawFinalEffects(void)
 	bool doDither = config->ps2Dither;
 	float exposure = config->exposure;
 
-	if(!doYCbCr && !doBloom && !doToneMap && !doDither && exposure == 1.0f)
+	bool doVignette = config->vignetteStrength > 0.0f;
+	bool doCA = config->chromaticAberration > 0.0f;
+	bool doGrain = config->ps2Grain != 0;
+	float grainStrength = config->ps2GrainStrength;
+	bool doAutoExp = config->doAutoExposure != 0;
+
+	// renderScale: the scene was drawn into scaleRaster, so from here on we
+	// draw to the original raster again
+	RwTexture *scaleSrc = nil;
+	if(scaleSavedRaster != nil){
+		scaleSrc = scaleTexture;
+		setSceneRaster(scaleSavedRaster);
+		scaleSavedRaster = nil;
+	}
+	bool scaled = scaleSrc != nil;
+
+	if(!doYCbCr && !doBloom && !doToneMap && !doDither && !doVignette && !doCA
+			&& !doGrain && !doAutoExp && exposure == 1.0f && !scaled)
 		return;
 	if(finalPS == nil)
 		return;
@@ -1470,13 +1603,26 @@ CPostEffects::DrawFinalEffects(void)
 		doBloom = false;
 	if(doDither && !ensureDitherTexture(w, h))
 		doDither = false;
+	if(doGrain && !ensureSfxGrainTexture(w, h))
+		doGrain = false;
 
 	RwRaster *drawBuffer = RwCameraGetRaster(Scene.camera);
 	if(drawBuffer == nil)
 		return;
 
 	// scene, after all game post effects, into the front buffer
-	UpdateFrontBuffer();
+	if(scaled){
+		// upscale the low-res scene raster into the full-res front buffer
+		RwRect r;
+		r.x = 0;
+		r.y = 0;
+		r.w = w;
+		r.h = h;
+		RwRasterPushContext(pRasterFrontBuffer);
+		RwRasterRenderScaled(scaleRaster, &r);
+		RwRasterPopContext();
+	}else
+		UpdateFrontBuffer();
 
 	RwRenderStateSet(rwRENDERSTATETEXTUREFILTER, (void*)rwFILTERLINEAR);
 	RwRenderStateSet(rwRENDERSTATEFOGENABLE, (void*)FALSE);
@@ -1484,6 +1630,31 @@ CPostEffects::DrawFinalEffects(void)
 	RwRenderStateSet(rwRENDERSTATEZWRITEENABLE, (void*)FALSE);
 	RwRenderStateSet(rwRENDERSTATEVERTEXALPHAENABLE, (void*)FALSE);
 	RwD3D9SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+
+	// ---- auto exposure + night detection (smoothed ambient light level) ----
+	// CTimeCycle_GetAmbient* give the current timecycle ambient color (0..1);
+	// their average is ~0.3-0.5 in daylight and ~0.05-0.15 at night.
+	static float sfxNight = 0.0f;
+	static float sfxAutoExpCur = 1.0f;
+	{
+		float amb = ((float)CTimeCycle_GetAmbientRed()
+				+ (float)CTimeCycle_GetAmbientGreen()
+				+ (float)CTimeCycle_GetAmbientBlue()) / 3.0f;
+		float night = 1.0f - amb / 0.45f;
+		if(night < 0.0f) night = 0.0f;
+		if(night > 1.0f) night = 1.0f;
+		sfxNight += (night - sfxNight) * 0.05f;
+		if(doAutoExp){
+			float target = 1.0f + sfxNight * config->autoExposureGain;
+			sfxAutoExpCur += (target - sfxAutoExpCur) * 0.05f;
+		}else
+			sfxAutoExpCur = 1.0f;
+	}
+	if(doAutoExp)
+		exposure *= sfxAutoExpCur;
+	float bloomIntensity = doBloom
+			? config->bloomIntensity * (1.0f + config->bloomNightBoost * sfxNight)
+			: 0.0f;
 
 	// ---- bloom: bright pass + separable blur iterations, ping-pong A/B ----
 	// Each (vertical, horizontal) pair starts and ends in `src`, so after every
@@ -1533,7 +1704,8 @@ CPostEffects::DrawFinalEffects(void)
 		bloomResultTex = bloomTextureA;
 	}
 
-	// ---- final composite: scene (+bloom), exposure, tone map, grading, dither ----
+	// ---- final composite: scene (+bloom), exposure, tone map, grading,
+	//      vignette, chromatic aberration, grain/scanlines, dither ----
 	if(doBloom)
 		setSceneRaster(drawBuffer); // restore the scene raster as render target
 	RwRenderStateSet(rwRENDERSTATETEXTUREFILTER, (void*)rwFILTERNEAREST);
@@ -1586,13 +1758,22 @@ CPostEffects::DrawFinalEffects(void)
 		float params[4];
 		params[0] = exposure;
 		params[1] = doToneMap ? config->whitePoint : 0.0f;
-		params[2] = bloomResult ? config->bloomIntensity : 0.0f;
+		params[2] = bloomResult ? bloomIntensity : 0.0f;
 		params[3] = doDither ? 1.0f : 0.0f;
 		RwD3D9SetPixelShaderConstant(3, params, 1);
+	}
+	{
+		float fx[4];
+		fx[0] = doVignette ? config->vignetteStrength : 0.0f;
+		fx[1] = doCA ? config->chromaticAberration : 0.0f;
+		fx[2] = doGrain ? grainStrength : 0.0f;
+		fx[3] = 0.0f;
+		RwD3D9SetPixelShaderConstant(4, fx, 1);
 	}
 
 	RwD3D9SetTexture(bloomResultTex, 1);
 	RwD3D9SetTexture(doDither ? ditherTexture : nil, 2);
+	RwD3D9SetTexture(doGrain ? sfxGrainTexture : nil, 3);
 
 	overrideIm2dPixelShader = finalPS;
 	RwIm2DRenderIndexedPrimitive(rwPRIMTYPETRILIST, colorfilterVerts, 4, colorfilterIndices, 6);
@@ -1600,6 +1781,7 @@ CPostEffects::DrawFinalEffects(void)
 
 	RwD3D9SetTexture(nil, 1);
 	RwD3D9SetTexture(nil, 2);
+	RwD3D9SetTexture(nil, 3);
 
 	RwRenderStateSet(rwRENDERSTATETEXTUREFILTER, (void*)rwFILTERLINEAR);
 	RwRenderStateSet(rwRENDERSTATEZTESTENABLE, (void*)TRUE);

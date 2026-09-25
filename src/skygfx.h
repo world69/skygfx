@@ -135,6 +135,16 @@ struct Config {
 	int doToneMap;
 	float whitePoint;
 	int ps2Dither;
+
+	// screen fx 2
+	int doAutoExposure;
+	float autoExposureGain;
+	float bloomNightBoost;
+	float vignetteStrength;
+	float chromaticAberration;
+	int ps2Grain;
+	float ps2GrainStrength;
+	float renderScale;
 };
 extern int numConfigs;
 extern int currentConfig;
