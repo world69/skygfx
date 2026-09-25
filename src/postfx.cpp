@@ -1528,60 +1528,83 @@ static float sfxScaleS;
 //   y' = s*y + (1-s)   maps NDC [-1,1] onto [1-2s, 1]  (top s part)
 // A constant NDC offset can only be expressed pre-division through the z
 // term (w = m[3][2]*z), hence the m[0][2] / m[1][2] adjustments.
-typedef HRESULT (STDMETHODCALLTYPE *D3DSetTransformFn)(IDirect3Device9 *, D3DTRANSFORMSTATETYPE, const D3DMATRIX *);
-typedef HRESULT (STDMETHODCALLTYPE *D3DSetViewportFn)(IDirect3Device9 *, const D3DVIEWPORT9 *);
-typedef HRESULT (STDMETHODCALLTYPE *D3DGetViewportFn)(IDirect3Device9 *, D3DVIEWPORT9 *);
-typedef HRESULT (STDMETHODCALLTYPE *D3DGetTransformFn)(IDirect3Device9 *, D3DTRANSFORMSTATETYPE, D3DMATRIX *);
-static D3DSetTransformFn d3dSetTransformOrig;
-static D3DSetViewportFn d3dSetViewportOrig;
-static D3DGetViewportFn d3dGetViewport;
-static D3DGetTransformFn d3dGetTransform;
-
-static D3DMATRIX
-sfxRemappedProjection(const D3DMATRIX *m)
+struct SfxD3DViewport
 {
-	D3DMATRIX mm = *m;
+	long x, y;
+	unsigned int width, height;
+};
+// D3D9 device vtable slots (stable, standard DirectX9 layout):
+//   8  = SetViewport(const D3DVIEWPORT9 *)
+//   9  = GetViewport(D3DVIEWPORT9 *)
+//   15 = SetTransform(int type, const D3DMATRIX *)
+//   16 = GetTransform(int type, D3DMATRIX *)
+// Device methods are declared without D3D9 SDK types (the plugin SDK
+// include chain does not reliably provide the interfaces in this
+// translation unit): opaque pointers + x86 __stdcall only.
+// D3DVIEWPORT9 layout: { LONG x, y; DWORD Width, Height; } (16 bytes)
+// D3DMATRIX layout:    { float m[4][4]; }
+// D3DTS_PROJECTION = 2, D3D_OK = 0
+typedef int (__stdcall *sfxD3D2ArgFn)(void *, void *);
+typedef int (__stdcall *sfxD3D3ArgFn)(void *, int, void *);
+static sfxD3D2ArgFn d3dSetViewportOrig;
+static sfxD3D2ArgFn d3dGetViewport;
+static sfxD3D3ArgFn d3dSetTransformOrig;
+static sfxD3D3ArgFn d3dGetTransform;
+
+// remap the 4x4 float projection matrix in place (see formula above)
+static void
+sfxRemapProjection(float (*mm)[4])
+{
 	float s = sfxScaleS;
-	float p32 = mm.m[3][2];
-	mm.m[0][0] = s * mm.m[0][0];
-	mm.m[1][1] = s * mm.m[1][1];
-	mm.m[0][2] += (s - 1.0f) * p32;
-	mm.m[1][2] += (1.0f - s) * p32;
-	return mm;
+	float p32 = mm[3][2];
+	mm[0][0] = s * mm[0][0];
+	mm[1][1] = s * mm[1][1];
+	mm[0][2] += (s - 1.0f) * p32;
+	mm[1][2] += (1.0f - s) * p32;
 }
 
 // the viewport is wider than the low-res raster (full back buffer size)
 static bool
-sfxViewportOverRaster(const D3DVIEWPORT9 *vp)
+sfxViewportOverRaster(const struct SfxD3DViewport *vp)
 {
 	return scaleRaster != nil
-		&& (vp->Width > (UINT)scaleRaster->width || vp->Height > (UINT)scaleRaster->height);
+		&& (vp->width > (unsigned int)scaleRaster->width
+			|| vp->height > (unsigned int)scaleRaster->height);
 }
 
-static HRESULT STDMETHODCALLTYPE
-sfxSetTransformHook(IDirect3Device9 *dev, D3DTRANSFORMSTATETYPE type, const D3DMATRIX *m)
+static int __stdcall
+sfxSetTransformHook(void *dev, int type, void *m)
 {
-	if(type == D3DTS_PROJECTION && sfxScaleActive){
-		D3DVIEWPORT9 vp;
-		if(d3dGetViewport(dev, &vp) == D3D_OK && sfxViewportOverRaster(&vp)){
-			D3DMATRIX mm = sfxRemappedProjection(m);
-			return d3dSetTransformOrig(dev, type, &mm);
+	if(type == 2 /* D3DTS_PROJECTION */ && sfxScaleActive){
+		struct SfxD3DViewport vp;
+		if(d3dGetViewport(dev, &vp) == 0 /* D3D_OK */ && sfxViewportOverRaster(&vp)){
+			// copy first: the game may resubmit its own (unremapped) matrix
+			// buffer later, so it must not be modified in place
+			float mm[16];
+			int i;
+			for(i = 0; i < 16; i++)
+				mm[i] = ((float*)m)[i];
+			sfxRemapProjection((float(*)[4])mm);
+			return d3dSetTransformOrig(dev, type, mm);
 		}
 	}
 	return d3dSetTransformOrig(dev, type, m);
 }
 
-static HRESULT STDMETHODCALLTYPE
-sfxSetViewportHook(IDirect3Device9 *dev, const D3DVIEWPORT9 *vp)
+static int __stdcall
+sfxSetViewportHook(void *dev, void *vp)
 {
-	HRESULT hr = d3dSetViewportOrig(dev, vp);
-	if(sfxScaleActive && sfxViewportOverRaster(vp)){
+	int hr = d3dSetViewportOrig(dev, vp);
+	const struct SfxD3DViewport *v = (const struct SfxD3DViewport*)vp;
+	if(sfxScaleActive && sfxViewportOverRaster(v)){
 		// the viewport was widened after the low-res target was set (the
 		// game does this at scene start); remap the stored projection so
 		// the full FOV still fits the kept corner
-		D3DMATRIX m;
-		if(d3dGetTransform(dev, D3DTS_PROJECTION, &m) == D3D_OK)
-			d3dSetTransformOrig(dev, D3DTS_PROJECTION, sfxRemappedProjection(&m));
+		float mm[16];
+		if(d3dGetTransform(dev, 2 /* D3DTS_PROJECTION */, mm) == 0 /* D3D_OK */){
+			sfxRemapProjection((float(*)[4])mm);
+			d3dSetTransformOrig(dev, 2 /* D3DTS_PROJECTION */, mm);
+		}
 	}
 	return hr;
 }
@@ -1592,10 +1615,10 @@ sfxScaleInstallVtableHook(void)
 	if(sfxScaleVtPatched || d3d9device == nil)
 		return;
 	void **vt = (void**)d3d9device;
-	d3dSetViewportOrig = (D3DSetViewportFn)vt[8];
-	d3dGetViewport = (D3DGetViewportFn)vt[9];
-	d3dSetTransformOrig = (D3DSetTransformFn)vt[15];
-	d3dGetTransform = (D3DGetTransformFn)vt[16];
+	d3dSetViewportOrig = (sfxD3D2ArgFn)vt[8];
+	d3dGetViewport = (sfxD3D2ArgFn)vt[9];
+	d3dSetTransformOrig = (sfxD3D3ArgFn)vt[15];
+	d3dGetTransform = (sfxD3D3ArgFn)vt[16];
 	Patch((void*)(&vt[15]), (void*)sfxSetTransformHook);
 	Patch((void*)(&vt[8]), (void*)sfxSetViewportHook);
 	sfxScaleVtPatched = 1;
