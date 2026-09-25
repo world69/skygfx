@@ -1614,14 +1614,32 @@ sfxScaleInstallVtableHook(void)
 {
 	if(sfxScaleVtPatched || sfxScaleVtTried || d3d9device == nil)
 		return;
-	void **vt = (void**)d3d9device;
+	// the vtable is the FIRST member of the device object; the object
+	// itself must never be written (earlier revisions corrupted it)
+	void **vt = *(void**)d3d9device;
+	if(vt == nil)
+		return;
 	d3dSetViewportOrig = (sfxD3D2ArgFn)vt[8];
 	d3dGetViewport = (sfxD3D2ArgFn)vt[9];
 	d3dSetTransformOrig = (sfxD3D3ArgFn)vt[15];
 	d3dGetTransform = (sfxD3D3ArgFn)vt[16];
-	// entries 8..15 of the vtable live in the d3d9 module's read-only
-	// section, so the page has to be made writable first (and restored
-	// after); if that fails, leave the hooks disabled: renderScale then
+	// sanity check: the saved "original" methods must be code inside the
+	// d3d9 module (guards against an unexpected object layout)
+	HMODULE hD3D9 = GetModuleHandle("d3d9.dll");
+	if(hD3D9 == nil)
+		return;
+	IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER*)hD3D9;
+	IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS*)((char*)hD3D9 + dos->e_lfanew);
+	int lo = (int)hD3D9;
+	int hi = (int)hD3D9 + (int)nt->OptionalHeader.SizeOfImage;
+	if((int)d3dSetViewportOrig < lo || (int)d3dSetViewportOrig >= hi
+		|| (int)d3dSetTransformOrig < lo || (int)d3dSetTransformOrig >= hi){
+		sfxScaleVtTried = 1;
+		return;
+	}
+	// the vtable lives in the module's read-only section, so the page has
+	// to be made writable just for the patch and restored afterwards; if
+	// any of this fails, leave the hooks disabled: renderScale then
 	// degrades to the zoomed crop instead of crashing
 	size_t span = (size_t)((char*)&vt[16] - (char*)&vt[8]);
 	DWORD oldProt = 0;
