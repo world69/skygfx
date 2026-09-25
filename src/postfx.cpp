@@ -1515,7 +1515,7 @@ RwRaster *scaleRaster;
 RwTexture *scaleTexture;
 RwRaster *scaleSavedRaster;
 static int scaleLastW, scaleLastH, scaleLastDepth;
-static uint8 sfxScaleActive, sfxScaleVtPatched;
+static uint8 sfxScaleActive, sfxScaleVtPatched, sfxScaleVtTried;
 static float sfxScaleS;
 
 // While the low-res raster is the scene target, the D3D viewport stays at the
@@ -1612,16 +1612,28 @@ sfxSetViewportHook(void *dev, void *vp)
 static void
 sfxScaleInstallVtableHook(void)
 {
-	if(sfxScaleVtPatched || d3d9device == nil)
+	if(sfxScaleVtPatched || sfxScaleVtTried || d3d9device == nil)
 		return;
 	void **vt = (void**)d3d9device;
 	d3dSetViewportOrig = (sfxD3D2ArgFn)vt[8];
 	d3dGetViewport = (sfxD3D2ArgFn)vt[9];
 	d3dSetTransformOrig = (sfxD3D3ArgFn)vt[15];
 	d3dGetTransform = (sfxD3D3ArgFn)vt[16];
+	// entries 8..15 of the vtable live in the d3d9 module's read-only
+	// section, so the page has to be made writable first (and restored
+	// after); if that fails, leave the hooks disabled: renderScale then
+	// degrades to the zoomed crop instead of crashing
+	size_t span = (size_t)((char*)&vt[16] - (char*)&vt[8]);
+	DWORD oldProt = 0;
+	if(!VirtualProtect(&vt[8], span, PAGE_READWRITE, &oldProt)){
+		sfxScaleVtTried = 1;
+		return;
+	}
 	Patch((void*)(&vt[15]), (void*)sfxSetTransformHook);
 	Patch((void*)(&vt[8]), (void*)sfxSetViewportHook);
+	VirtualProtect(&vt[8], span, oldProt, &oldProt);
 	sfxScaleVtPatched = 1;
+	sfxScaleVtTried = 1;
 }
 
 static RwRaster *
