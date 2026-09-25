@@ -1515,6 +1515,91 @@ RwRaster *scaleRaster;
 RwTexture *scaleTexture;
 RwRaster *scaleSavedRaster;
 static int scaleLastW, scaleLastH, scaleLastDepth;
+static uint8 sfxScaleActive, sfxScaleVtPatched;
+static float sfxScaleS;
+
+// While the low-res raster is the scene target, the D3D viewport stays at the
+// back buffer size (the game (re)sets it after our before-scene hook), so a
+// full-size NDC frame only keeps its top-left s x s corner in the small
+// raster - which shows up as a zoomed crop. We therefore remap every
+// projection matrix that reaches the device during the scene pass so the
+// full FOV lands in that corner:
+//   x' = s*x + (s-1)   maps NDC [-1,1] onto [-1, 2s-1] (left s part)
+//   y' = s*y + (1-s)   maps NDC [-1,1] onto [1-2s, 1]  (top s part)
+// A constant NDC offset can only be expressed pre-division through the z
+// term (w = m[3][2]*z), hence the m[0][2] / m[1][2] adjustments.
+typedef HRESULT (STDMETHODCALLTYPE *D3DSetTransformFn)(IDirect3Device9 *, D3DTRANSFORMSTATETYPE, const D3DMATRIX *);
+typedef HRESULT (STDMETHODCALLTYPE *D3DSetViewportFn)(IDirect3Device9 *, const D3DVIEWPORT9 *);
+typedef HRESULT (STDMETHODCALLTYPE *D3DGetViewportFn)(IDirect3Device9 *, D3DVIEWPORT9 *);
+typedef HRESULT (STDMETHODCALLTYPE *D3DGetTransformFn)(IDirect3Device9 *, D3DTRANSFORMSTATETYPE, D3DMATRIX *);
+static D3DSetTransformFn d3dSetTransformOrig;
+static D3DSetViewportFn d3dSetViewportOrig;
+static D3DGetViewportFn d3dGetViewport;
+static D3DGetTransformFn d3dGetTransform;
+
+static D3DMATRIX
+sfxRemappedProjection(const D3DMATRIX *m)
+{
+	D3DMATRIX mm = *m;
+	float s = sfxScaleS;
+	float p32 = mm.m[3][2];
+	mm.m[0][0] = s * mm.m[0][0];
+	mm.m[1][1] = s * mm.m[1][1];
+	mm.m[0][2] += (s - 1.0f) * p32;
+	mm.m[1][2] += (1.0f - s) * p32;
+	return mm;
+}
+
+// the viewport is wider than the low-res raster (full back buffer size)
+static bool
+sfxViewportOverRaster(const D3DVIEWPORT9 *vp)
+{
+	return scaleRaster != nil
+		&& (vp->Width > (UINT)scaleRaster->width || vp->Height > (UINT)scaleRaster->height);
+}
+
+static HRESULT STDMETHODCALLTYPE
+sfxSetTransformHook(IDirect3Device9 *dev, D3DTRANSFORMSTATETYPE type, const D3DMATRIX *m)
+{
+	if(type == D3DTS_PROJECTION && sfxScaleActive){
+		D3DVIEWPORT9 vp;
+		if(d3dGetViewport(dev, &vp) == D3D_OK && sfxViewportOverRaster(&vp)){
+			D3DMATRIX mm = sfxRemappedProjection(m);
+			return d3dSetTransformOrig(dev, type, &mm);
+		}
+	}
+	return d3dSetTransformOrig(dev, type, m);
+}
+
+static HRESULT STDMETHODCALLTYPE
+sfxSetViewportHook(IDirect3Device9 *dev, const D3DVIEWPORT9 *vp)
+{
+	HRESULT hr = d3dSetViewportOrig(dev, vp);
+	if(sfxScaleActive && sfxViewportOverRaster(vp)){
+		// the viewport was widened after the low-res target was set (the
+		// game does this at scene start); remap the stored projection so
+		// the full FOV still fits the kept corner
+		D3DMATRIX m;
+		if(d3dGetTransform(dev, D3DTS_PROJECTION, &m) == D3D_OK)
+			d3dSetTransformOrig(dev, D3DTS_PROJECTION, sfxRemappedProjection(&m));
+	}
+	return hr;
+}
+
+static void
+sfxScaleInstallVtableHook(void)
+{
+	if(sfxScaleVtPatched || d3d9device == nil)
+		return;
+	void **vt = (void**)d3d9device;
+	d3dSetViewportOrig = (D3DSetViewportFn)vt[8];
+	d3dGetViewport = (D3DGetViewportFn)vt[9];
+	d3dSetTransformOrig = (D3DSetTransformFn)vt[15];
+	d3dGetTransform = (D3DGetTransformFn)vt[16];
+	Patch((void*)(&vt[15]), (void*)sfxSetTransformHook);
+	Patch((void*)(&vt[8]), (void*)sfxSetViewportHook);
+	sfxScaleVtPatched = 1;
+}
 
 static RwRaster *
 ensureScaleRaster(int w, int h, RwInt32 depth)
@@ -1543,11 +1628,13 @@ RenderScale_Begin(void)
 		s = 0.5f;
 	if(s >= 1.0f){
 		scaleSavedRaster = nil;
+		sfxScaleActive = 0;
 		return;
 	}
 	RwRaster *camR = RwCameraGetRaster(Scene.camera);
 	if(camR == nil || camR->width < 64 || camR->height < 64){
 		scaleSavedRaster = nil;
+		sfxScaleActive = 0;
 		return;
 	}
 	int w = ((int)(camR->width * s) + 1) & ~1;
@@ -1557,10 +1644,23 @@ RenderScale_Begin(void)
 	RwRaster *sr = ensureScaleRaster(w, h, camR->depth);
 	if(sr == nil){
 		scaleSavedRaster = nil;
+		sfxScaleActive = 0;
 		return;
 	}
 	scaleSavedRaster = camR;
 	setSceneRaster(sr);
+	sfxScaleInstallVtableHook();
+	sfxScaleS = s;
+	sfxScaleActive = 1;
+}
+
+// Called from RenderScene_after() once the 3D scene pass is done: the
+// reflection/env passes and the game's own post effects must run with normal
+// D3D state, so the projection remap is suspended from here on
+void
+RenderScale_EndOfScene(void)
+{
+	sfxScaleActive = 0;
 }
 
 void
@@ -1585,6 +1685,7 @@ CPostEffects::DrawFinalEffects(void)
 		scaleSrc = scaleTexture;
 		setSceneRaster(scaleSavedRaster);
 		scaleSavedRaster = nil;
+		sfxScaleActive = 0;
 	}
 	bool scaled = scaleSrc != nil;
 

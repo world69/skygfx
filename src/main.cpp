@@ -809,6 +809,7 @@ void RenderReflectionMap_leeds(void);
 void RenderReflectionScene(void);
 void DrawDebugEnvMap(void);
 void RenderScale_Begin(void);
+void RenderScale_EndOfScene(void);
 
 bool
 RenderScene_before(void*)
@@ -833,6 +834,9 @@ RenderScene_before(void*)
 bool
 RenderScene_after(void*)
 {
+	// the 3D scene pass is done: stop the renderScale projection remap so
+	// the reflection/env passes and game post effects use normal D3D state
+	RenderScale_EndOfScene();
 	if(config->vehiclePipe == CAR_NEO)
 		CarPipe::RenderEnvTex();
 	else if(config->vehiclePipe == CAR_LCS || config->vehiclePipe == CAR_VCS)
