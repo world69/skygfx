@@ -1525,15 +1525,22 @@ ensureSfxGrainTexture(int w, int h)
 // 1600x900 raster remaps the whole NDC cube into that rectangle - same
 // projection, same FOV, same image, just fewer pixels (fill rate is still
 // saved, rasterization is bounded by the viewport). DrawFinalEffects() then
-// stretches exactly that rectangle into the front buffer (UVs 0..scale), so
-// nothing is cropped and nothing can zoom. While the scene renders, every
-// SetViewport at full size or bigger is rewritten through the hooked vtable
-// slot (smaller ones = in-scene RT passes, untouched), and the scaled
-// viewport is re-asserted after each in-scene projection change.
+// stretches exactly that rectangle over the whole raster at the END of the
+// scene (RenderScale_EndOfScene), so the frame is already full-size when the
+// game draws its HUD - the HUD and every other 2D element keep their regular
+// full-raster coordinates and can never be cropped or zoomed. (An earlier
+// attempt kept the scaled viewport alive for the HUD phase instead, but RW
+// immediate-mode 2D vertices are raster space and ignore the D3D viewport
+// entirely, so that cannot move the HUD.) While the scene renders, every
+// SetViewport issued at exactly the scene raster size is rewritten through
+// the hooked vtable slot (anything else belongs to another pass's own
+// target and passes through), and the scaled viewport is re-asserted after
+// each projection change.
 static uint8 sfxScaleActive, sfxScaleVtPatched, sfxScaleVtTried, sfxVpScaled;
 static uint8 sfxScaleApplied; // frame uses the scaled viewport (DrawFinalEffects)
+static uint8 sfxScaleInScene; // log only: scene phase vs HUD phase
 static unsigned int sfxScaleW, sfxScaleH; // scaled viewport size (even)
-static unsigned int sfxSceneW, sfxSceneH; // full scene raster size (log only)
+static unsigned int sfxSceneW, sfxSceneH; // full scene raster size
 
 struct SfxD3DViewport
 {
@@ -1570,14 +1577,6 @@ static sfxD3D2ArgFn d3dSetViewportOrig;
 static sfxD3D2ArgFn d3dGetViewport;
 static sfxD3D3ArgFn d3dSetTransformOrig;
 
-// does this viewport differ from the scaled scene viewport we want?
-static bool
-sfxVpNotScaled(const struct SfxD3DViewport *vp)
-{
-	return vp->x != 0 || vp->y != 0
-		|| vp->width != sfxScaleW || vp->height != sfxScaleH;
-}
-
 // --- diagnostics (renderScaleDebugLog=1): append D3D state events to
 // skygfx_renderScale.log in the game folder (first 20000 lines) ---
 static FILE *sfxLog;
@@ -1593,7 +1592,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.2) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.4) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -1630,27 +1629,30 @@ sfxSetTransformHook(void *dev, int type, void *m)
 	return d3dSetTransformOrig(dev, type, m);
 }
 
-// the whole fix: while the scale window is open, every SetViewport at full
-// size or bigger is rewritten to the scaled viewport before it reaches the
-// device - full FOV in fewer pixels, no zoom, no matrix tricks, no matter
-// who resets the viewport and when. Viewports SMALLER than the scaled size
-// belong to in-scene RT passes (shadow maps and friends) and pass through
-// untouched.
+// the whole fix: while the scale window is open (scene + HUD phase, up to
+// DrawFinalEffects), every SetViewport issued at exactly the full scene
+// raster size is rewritten to the scaled viewport before it reaches the
+// device - that call is RW re-beginning the camera, or the game starting a
+// full-screen pass (HUD, radar), and all of it must land in the scaled
+// rectangle. Viewports of any other size belong to other passes' own
+// targets (shadow maps, env maps, the 2048x1024 post buffer) and pass
+// through untouched.
 static int __stdcall
 sfxSetViewportHook(void *dev, void *vp)
 {
 	struct SfxD3DViewport *v = (struct SfxD3DViewport*)vp;
 	if(sfxScaleActive){
-		if(sfxVpNotScaled(v)
-				&& v->width >= sfxScaleW && v->height >= sfxScaleH){
+		if(v->width == sfxSceneW && v->height == sfxSceneH){
 			struct SfxD3DViewport c = {0, 0, sfxScaleW, sfxScaleH, 0.0f, 1.0f};
 			if(sfxLogC++ < 16)
-				sfxLogLine("C vp=%ux%u -> %ux%u\n",
+				sfxLogLine("%c vp=%ux%u -> %ux%u\n",
+					sfxScaleInScene ? 'C' : 'H',
 					v->width, v->height, c.width, c.height);
 			return d3dSetViewportOrig(dev, &c);
 		}
 		if(sfxLogS++ < 8)
-			sfxLogLine("S vp=%ux%u\n", v->width, v->height);
+			sfxLogLine("S vp=%ux%u win=%d\n",
+				v->width, v->height, (int)sfxScaleInScene);
 	}else if(sfxLogV0++ < 8)
 		sfxLogLine("V0 vp=%ux%u\n", v->width, v->height);
 	return d3dSetViewportOrig(dev, vp);
@@ -1759,24 +1761,73 @@ RenderScale_Begin(void)
 	struct SfxD3DViewport vp = {0, 0, (unsigned int)w, (unsigned int)h, 0.0f, 1.0f};
 	d3dSetViewportOrig(d3d9device, &vp);
 	sfxVpScaled = 1;
+	sfxScaleInScene = 1;
 	sfxLogLine("B begin: scale=%.2f raster=%ux%u vp=%ux%u -> force %dx%d\n",
 		s, sfxSceneW, sfxSceneH, sfxVpFull.width, sfxVpFull.height, w, h);
 }
 
-// Called from RenderScene_after() once the 3D scene pass is done: hand the
-// full-size viewport back so the reflection/env passes and the game's own
-// post effects keep normal D3D state. DrawFinalEffects() may already have
-// restored it (it needs the full viewport for the composite) - then this is
-// a no-op.
+// Called from RenderScene_after() once the 3D scene pass is done: close the
+// window, take the full viewport back and immediately stretch the scaled
+// rectangle over the whole raster. The game then draws its HUD and every
+// other 2D element on top of the finished full-size frame with its regular
+// full-raster coordinates (RW immediate-mode 2D is raster space - it ignores
+// the D3D viewport, so the HUD can not be scaled along with the scene; it
+// must be drawn AFTER the stretch).
 void
 RenderScale_EndOfScene(void)
 {
-	if(sfxVpScaled && sfxVpFull.width != 0 && d3dSetViewportOrig){
-		d3dSetViewportOrig(d3d9device, &sfxVpFull);
-		sfxLogLine("R vp restored %ux%u\n", sfxVpFull.width, sfxVpFull.height);
-	}
-	sfxVpScaled = 0;
+	if(!sfxScaleApplied)
+		return;
+	sfxScaleApplied = 0;
 	sfxScaleActive = 0;
+	sfxScaleInScene = 0;
+	RwRaster *camR = RwCameraGetRaster(Scene.camera);
+	if(camR == nil || (sfxStretchRaster == nil
+			&& !ensureStretchRaster(camR->width, camR->height, camR->depth))){
+		sfxLogLine("R no stretch (raster/scratch)\n");
+		return;
+	}
+	// camera back on the full raster - RW re-issues the full-size viewport
+	setSceneRaster(camR);
+	// 1:1 copy of the frame into the scratch raster (the camera raster is
+	// the back buffer and can not be sampled as a texture - that was the
+	// v9.1 white screen)
+	RwCameraEndUpdate(Scene.camera);
+	RwRasterPushContext(sfxStretchRaster);
+	RwRasterRenderFast(camR, 0, 0);
+	RwRasterPopContext();
+	RwCameraBeginUpdate(Scene.camera);
+	// stretch the top-left sfxScaleW x sfxScaleH over the full raster
+	static RwIm2DVertex sv[4];
+	float nearscreen = RwIm2DGetNearScreenZ();
+	float nearcam = RwCameraGetNearClipPlane(Scene.camera);
+	float recipz = 1.0f/nearcam;
+	float uw = sfxScaleW / (float)camR->width;
+	float vh = sfxScaleH / (float)camR->height;
+	quadSetUV(sv, 0.0f, 0.0f, uw, vh);
+	quadSetXY(sv, 0.0f, 0.0f, (float)camR->width, (float)camR->height);
+	for(int i = 0; i < 4; i++){
+		RwIm2DVertexSetScreenZ(&sv[i], nearscreen);
+		RwIm2DVertexSetCameraZ(&sv[i], nearcam);
+		RwIm2DVertexSetRecipCameraZ(&sv[i], recipz);
+		RwIm2DVertexSetIntRGBA(&sv[i], 255, 255, 255, 255);
+	}
+	RwRenderStateSet(rwRENDERSTATETEXTUREFILTER, (void*)rwFILTERLINEAR);
+	RwRenderStateSet(rwRENDERSTATEFOGENABLE, (void*)FALSE);
+	RwRenderStateSet(rwRENDERSTATEZTESTENABLE, (void*)FALSE);
+	RwRenderStateSet(rwRENDERSTATEZWRITEENABLE, (void*)FALSE);
+	RwRenderStateSet(rwRENDERSTATEVERTEXALPHAENABLE, (void*)FALSE);
+	RwD3D9SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+	RwRenderStateSet(rwRENDERSTATETEXTURERASTER, (void*)sfxStretchRaster);
+	RwIm2DRenderIndexedPrimitive(rwPRIMTYPETRILIST, sv, 4, colorfilterIndices, 6);
+	RwRenderStateSet(rwRENDERSTATEZTESTENABLE, (void*)TRUE);
+	RwRenderStateSet(rwRENDERSTATEZWRITEENABLE, (void*)TRUE);
+	RwRenderStateSet(rwRENDERSTATETEXTURERASTER, (void*)NULL);
+	RwRenderStateSet(rwRENDERSTATEVERTEXALPHAENABLE, (void*)TRUE);
+	RwD3D9SetRenderState(D3DRS_ALPHATESTENABLE, TRUE);
+	sfxVpScaled = 0;
+	sfxLogLine("R stretch %ux%u -> %ux%u\n",
+		sfxScaleW, sfxScaleH, camR->width, camR->height);
 }
 
 // full-size scratch raster for the stretch pass (same recipe as the bloom
@@ -1801,6 +1852,19 @@ ensureStretchRaster(int w, int h, RwInt32 depth)
 void
 CPostEffects::DrawFinalEffects(void)
 {
+	// safety: make sure the scale window is closed and the full viewport is
+	// back - RenderScale_EndOfScene normally did both (and stretched the
+	// frame already); this only fires on odd frames that skip it
+	if(sfxScaleActive){
+		sfxScaleActive = 0;
+		if(sfxVpScaled && sfxVpFull.width != 0 && d3dSetViewportOrig){
+			d3dSetViewportOrig(d3d9device, &sfxVpFull);
+			sfxLogLine("F0 close vp restored %ux%u\n",
+				sfxVpFull.width, sfxVpFull.height);
+		}
+		sfxVpScaled = 0;
+	}
+
 	bool doYCbCr = m_bYCbCrFilter;
 	bool doBloom = config->doBloom;
 	bool doToneMap = config->doToneMap;
@@ -1813,15 +1877,13 @@ CPostEffects::DrawFinalEffects(void)
 	float grainStrength = config->ps2GrainStrength;
 	bool doAutoExp = config->doAutoExposure != 0;
 
-	// renderScale: the scene was drawn with a scaled viewport into the
-	// top-left sfxScaleW x sfxScaleH of the original raster - stretch exactly
-	// that region into the front buffer below (taking the full-size viewport
-	// back first)
-	bool scaled = sfxScaleApplied != 0;
-	sfxScaleApplied = 0;
+	// renderScale: the frame was already stretched to full size in
+	// RenderScale_EndOfScene (before the game drew its HUD), so this
+	// function needs no scale-specific handling - it just runs the normal
+	// post-FX chain on the finished frame
 
 	if(!doYCbCr && !doBloom && !doToneMap && !doDither && !doVignette && !doCA
-			&& !doGrain && !doAutoExp && exposure == 1.0f && !scaled)
+			&& !doGrain && !doAutoExp && exposure == 1.0f)
 		return;
 	if(finalPS == nil)
 		return;
@@ -1843,62 +1905,7 @@ CPostEffects::DrawFinalEffects(void)
 		return;
 
 	// scene, after all game post effects, into the front buffer
-	bool stretched = false;
-	if(scaled){
-		// the scene lives in the top-left sfxScaleW x sfxScaleH of the full
-		// raster (scaled viewport) - stretch exactly that rectangle. First
-		// take the full-size viewport back: this pass and the final
-		// composite below cover the whole raster
-		if(sfxVpScaled && sfxVpFull.width != 0 && d3dSetViewportOrig){
-			d3dSetViewportOrig(d3d9device, &sfxVpFull);
-			sfxVpScaled = 0;
-			sfxLogLine("F vp restored %ux%u\n", sfxVpFull.width, sfxVpFull.height);
-		}
-		// The camera raster is the back buffer and can NOT be sampled as a
-		// texture - v9.1 tried and every sample came back white (vignette
-		// over plain white = the grey frame that was reported). So copy it
-		// into a scratch raster 1:1 first (exactly what UpdateFrontBuffer
-		// does), then stretch the scratch's top-left scaled rectangle into
-		// pRasterFrontBuffer with a textured quad. The quad draws with a
-		// camera in update (Im2D needs the camera context - the v9 crash)
-		// and reads the scratch, never the camera raster.
-		RwRaster *scratch = ensureStretchRaster(w, h, pRasterFrontBuffer->depth);
-		if(scratch != nil){
-			RwCameraEndUpdate(Scene.camera);
-			RwRasterPushContext(scratch);
-			RwRasterRenderFast(drawBuffer, 0, 0);
-			RwRasterPopContext();
-			RwCameraBeginUpdate(Scene.camera);
-			static RwIm2DVertex sv[4];
-			float nearscreen = RwIm2DGetNearScreenZ();
-			float nearcam = RwCameraGetNearClipPlane(Scene.camera);
-			float recipz = 1.0f/nearcam;
-			float uw = sfxScaleW / (float)drawBuffer->width;
-			float vh = sfxScaleH / (float)drawBuffer->height;
-			quadSetUV(sv, 0.0f, 0.0f, uw, vh);
-			quadSetXY(sv, 0.0f, 0.0f, (float)w, (float)h);
-			for(int i = 0; i < 4; i++){
-				RwIm2DVertexSetScreenZ(&sv[i], nearscreen);
-				RwIm2DVertexSetCameraZ(&sv[i], nearcam);
-				RwIm2DVertexSetRecipCameraZ(&sv[i], recipz);
-				RwIm2DVertexSetIntRGBA(&sv[i], 255, 255, 255, 255);
-			}
-			setSceneRaster(pRasterFrontBuffer);
-			RwRenderStateSet(rwRENDERSTATETEXTUREFILTER, (void*)rwFILTERLINEAR);
-			RwRenderStateSet(rwRENDERSTATEFOGENABLE, (void*)FALSE);
-			RwRenderStateSet(rwRENDERSTATEZTESTENABLE, (void*)FALSE);
-			RwRenderStateSet(rwRENDERSTATEZWRITEENABLE, (void*)FALSE);
-			RwRenderStateSet(rwRENDERSTATEVERTEXALPHAENABLE, (void*)FALSE);
-			RwD3D9SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
-			RwRenderStateSet(rwRENDERSTATETEXTURERASTER, (void*)scratch);
-			RwIm2DRenderIndexedPrimitive(rwPRIMTYPETRILIST, sv, 4, colorfilterIndices, 6);
-			setSceneRaster(drawBuffer);
-			sfxLogLine("F2 stretch %ux%u -> %dx%d\n", sfxScaleW, sfxScaleH, w, h);
-			stretched = true;
-		}
-	}
-	if(!stretched)
-		UpdateFrontBuffer();
+	UpdateFrontBuffer();
 
 	RwRenderStateSet(rwRENDERSTATETEXTUREFILTER, (void*)rwFILTERLINEAR);
 	RwRenderStateSet(rwRENDERSTATEFOGENABLE, (void*)FALSE);
