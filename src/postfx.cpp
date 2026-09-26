@@ -1527,9 +1527,9 @@ ensureSfxGrainTexture(int w, int h)
 // saved, rasterization is bounded by the viewport). DrawFinalEffects() then
 // stretches exactly that rectangle into the front buffer (UVs 0..scale), so
 // nothing is cropped and nothing can zoom. While the scene renders, every
-// SetViewport that does not match the scaled size is rewritten through the
-// hooked vtable slot, and the scaled viewport is re-asserted after each
-// in-scene projection change.
+// SetViewport at full size or bigger is rewritten through the hooked vtable
+// slot (smaller ones = in-scene RT passes, untouched), and the scaled
+// viewport is re-asserted after each in-scene projection change.
 static uint8 sfxScaleActive, sfxScaleVtPatched, sfxScaleVtTried, sfxVpScaled;
 static uint8 sfxScaleApplied; // frame uses the scaled viewport (DrawFinalEffects)
 static unsigned int sfxScaleW, sfxScaleH; // scaled viewport size (even)
@@ -1586,7 +1586,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.1) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -1623,16 +1623,19 @@ sfxSetTransformHook(void *dev, int type, void *m)
 	return d3dSetTransformOrig(dev, type, m);
 }
 
-// the whole fix: while the scale window is open, every SetViewport that does
-// not match the scaled viewport is rewritten to it before it reaches the
+// the whole fix: while the scale window is open, every SetViewport at full
+// size or bigger is rewritten to the scaled viewport before it reaches the
 // device - full FOV in fewer pixels, no zoom, no matrix tricks, no matter
-// who resets the viewport and when
+// who resets the viewport and when. Viewports SMALLER than the scaled size
+// belong to in-scene RT passes (shadow maps and friends) and pass through
+// untouched.
 static int __stdcall
 sfxSetViewportHook(void *dev, void *vp)
 {
 	struct SfxD3DViewport *v = (struct SfxD3DViewport*)vp;
 	if(sfxScaleActive){
-		if(sfxVpNotScaled(v)){
+		if(sfxVpNotScaled(v)
+				&& v->width >= sfxScaleW && v->height >= sfxScaleH){
 			struct SfxD3DViewport c = {0, 0, sfxScaleW, sfxScaleH, 0.0f, 1.0f};
 			if(sfxLogC++ < 16)
 				sfxLogLine("C vp=%ux%u -> %ux%u\n",
@@ -1825,7 +1828,13 @@ CPostEffects::DrawFinalEffects(void)
 			sfxLogLine("F vp restored %ux%u\n", sfxVpFull.width, sfxVpFull.height);
 		}
 		// like UpdateFrontBuffer(), but with a textured quad whose UVs stop
-		// at the scaled rectangle instead of a 1:1 RwRasterRenderFast blit
+		// at the scaled rectangle instead of a 1:1 RwRasterRenderFast blit.
+		// RwIm2DRenderIndexedPrimitive needs a camera in update (RW keeps
+		// per-camera state the immediate-mode renderer reads - drawing with
+		// no camera context crashed in rwD3D9Im2DRenderIndexedPrimitive at
+		// +0x1a, NULL+0x60), so point the camera at the front buffer for the
+		// quad, exactly the way setSceneRaster/bloom switch targets, and
+		// point it back afterwards
 		static RwIm2DVertex sv[4];
 		float nearscreen = RwIm2DGetNearScreenZ();
 		float nearcam = RwCameraGetNearClipPlane(Scene.camera);
@@ -1840,8 +1849,7 @@ CPostEffects::DrawFinalEffects(void)
 			RwIm2DVertexSetRecipCameraZ(&sv[i], recipz);
 			RwIm2DVertexSetIntRGBA(&sv[i], 255, 255, 255, 255);
 		}
-		RwCameraEndUpdate(Scene.camera);
-		RwRasterPushContext(pRasterFrontBuffer);
+		setSceneRaster(pRasterFrontBuffer);
 		RwRenderStateSet(rwRENDERSTATETEXTUREFILTER, (void*)rwFILTERLINEAR);
 		RwRenderStateSet(rwRENDERSTATEFOGENABLE, (void*)FALSE);
 		RwRenderStateSet(rwRENDERSTATEZTESTENABLE, (void*)FALSE);
@@ -1850,8 +1858,7 @@ CPostEffects::DrawFinalEffects(void)
 		RwD3D9SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
 		RwRenderStateSet(rwRENDERSTATETEXTURERASTER, (void*)drawBuffer);
 		RwIm2DRenderIndexedPrimitive(rwPRIMTYPETRILIST, sv, 4, colorfilterIndices, 6);
-		RwRasterPopContext();
-		RwCameraBeginUpdate(Scene.camera);
+		setSceneRaster(drawBuffer);
 	}else
 		UpdateFrontBuffer();
 
