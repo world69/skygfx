@@ -1515,7 +1515,7 @@ RwRaster *scaleRaster;
 RwTexture *scaleTexture;
 RwRaster *scaleSavedRaster;
 static int scaleLastW, scaleLastH, scaleLastDepth;
-static uint8 sfxScaleActive, sfxScaleVtPatched, sfxScaleVtTried;
+static uint8 sfxScaleActive, sfxScaleVtPatched, sfxScaleVtTried, sfxProjRemapped;
 static float sfxScaleS;
 
 // While the low-res raster is the scene target, the D3D viewport stays at the
@@ -1572,21 +1572,53 @@ sfxViewportOverRaster(const struct SfxD3DViewport *vp)
 			|| vp->height > (unsigned int)scaleRaster->height);
 }
 
+// optional diagnostics: when renderScaleDebugLog=1, append the D3D
+// viewport/projection events that happen while the remap is active to
+// skygfx_renderScale.log in the game folder (first 20000 events)
+static FILE *sfxLog;
+static int sfxLogCount;
+static void
+sfxLogEvent(char what, int remapped)
+{
+	if(!config->renderScaleDebugLog || sfxLogCount >= 20000)
+		return;
+	if(sfxLog == nil){
+		sfxLog = fopen("skygfx_renderScale.log", "a");
+		if(sfxLog == nil)
+			return;
+		fprintf(sfxLog, "==== renderScale log, scale=%.2f ====\n", sfxScaleS);
+	}
+	fprintf(sfxLog, "%06d %c remapped=%d\n", sfxLogCount, what, remapped);
+	if((++sfxLogCount % 32) == 0)
+		fflush(sfxLog);
+}
+
+// NOTE: the remap must be applied exactly ONCE per stored projection
+// matrix. sfxProjRemapped tracks whether the matrix currently in the
+// device is already remapped, no matter in which order the game issues
+// SetTransform / SetViewport during the scene pass (remapping twice
+// squashes the FOV to s*s and shifts the frame).
 static int __stdcall
 sfxSetTransformHook(void *dev, int type, void *m)
 {
 	if(type == 2 /* D3DTS_PROJECTION */ && sfxScaleActive){
 		struct SfxD3DViewport vp;
 		if(d3dGetViewport(dev, &vp) == 0 /* D3D_OK */ && sfxViewportOverRaster(&vp)){
-			// copy first: the game may resubmit its own (unremapped) matrix
-			// buffer later, so it must not be modified in place
+			// the viewport is at the full back buffer size while the
+			// target is the small raster: remap this (fresh) matrix so
+			// the full FOV fits the kept corner
 			float mm[16];
 			int i;
 			for(i = 0; i < 16; i++)
 				mm[i] = ((float*)m)[i];
 			sfxRemapProjection((float(*)[4])mm);
+			sfxProjRemapped = 1;
+			sfxLogEvent('T', 1);
 			return d3dSetTransformOrig(dev, type, mm);
 		}
+		// the viewport fits the raster: the stored matrix is unremapped
+		sfxProjRemapped = 0;
+		sfxLogEvent('t', 0);
 	}
 	return d3dSetTransformOrig(dev, type, m);
 }
@@ -1597,14 +1629,18 @@ sfxSetViewportHook(void *dev, void *vp)
 	int hr = d3dSetViewportOrig(dev, vp);
 	const struct SfxD3DViewport *v = (const struct SfxD3DViewport*)vp;
 	if(sfxScaleActive && sfxViewportOverRaster(v)){
-		// the viewport was widened after the low-res target was set (the
-		// game does this at scene start); remap the stored projection so
-		// the full FOV still fits the kept corner
-		float mm[16];
-		if(d3dGetTransform(dev, 2 /* D3DTS_PROJECTION */, mm) == 0 /* D3D_OK */){
-			sfxRemapProjection((float(*)[4])mm);
-			d3dSetTransformOrig(dev, 2 /* D3DTS_PROJECTION */, mm);
+		// the viewport was widened over the small raster (the game does
+		// this at scene start); if the stored projection is still the
+		// game's raw matrix, remap it - but never remap twice
+		if(!sfxProjRemapped){
+			float mm[16];
+			if(d3dGetTransform(dev, 2 /* D3DTS_PROJECTION */, mm) == 0 /* D3D_OK */){
+				sfxRemapProjection((float(*)[4])mm);
+				d3dSetTransformOrig(dev, 2 /* D3DTS_PROJECTION */, mm);
+				sfxProjRemapped = 1;
+			}
 		}
+		sfxLogEvent('V', sfxProjRemapped);
 	}
 	return hr;
 }

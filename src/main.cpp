@@ -1160,6 +1160,7 @@ readIni(int n)
 	c->renderScale = readfloat(cfg.get("SkyGfx", "renderScale", ""), 1.0f);
 	if(c->renderScale < 0.5f) c->renderScale = 0.5f;
 	if(c->renderScale > 1.0f) c->renderScale = 1.0f;
+	c->renderScaleDebugLog = readint(cfg.get("SkyGfx", "renderScaleDebugLog", ""), 0);
 	c->doglare = readint(cfg.get("SkyGfx", "sunGlare", ""), -1);
 	if(c->doglare < 0){
 		iCanHasSunGlare = false;

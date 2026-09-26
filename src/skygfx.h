@@ -145,6 +145,7 @@ struct Config {
 	int ps2Grain;
 	float ps2GrainStrength;
 	float renderScale;
+	int renderScaleDebugLog;
 };
 extern int numConfigs;
 extern int currentConfig;
