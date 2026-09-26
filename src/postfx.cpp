@@ -1606,7 +1606,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.6) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.7) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -1733,12 +1733,101 @@ sfxScaleInstallVtableHook(void)
 	sfxScaleVtTried = 1;
 }
 
+// ---------------------------------------------------------------------------
+// v9.7: the night world overlays that depth-test against the scene
+// (CCoronas::Render - street/car lamp coronas, CBrightLights::Render -
+// building windows, CShinyTexts::Render - neon signs, C3dMarkers::Render)
+// must be drawn BEFORE the end-of-scene stretch. The scene renders into
+// the top-left sfxScaleW x sfxScaleH of the back buffer and only the
+// colour is stretched to full size; the depth buffer stays in the
+// sub-rect layout. Anything z-tested that is drawn after the stretch
+// compares against that stale depth map and pops in front of nearby
+// geometry - the "lights shine through buildings at night" bug at
+// renderScale < 1.0. So run the real render functions right before the
+// stretch, while their depth is still consistent with the scene, and
+// swallow the game's own (now duplicate) calls for the rest of the
+// frame. When renderScale is 1.0 nothing is ever flagged drawn and the
+// hooks just pass through.
+typedef void (*sfxVoidCall)();
+struct SfxW2DHook {
+	unsigned int addr;		// game function, 1.0 US
+	unsigned char orig[5];	// original first 5 bytes
+	unsigned char jmp[5];		// our E9 jmp
+	int ok;
+};
+static SfxW2DHook sfxW2Dhooks[4] = {
+	{0x6FAEC0, {0}, {0}, 0},	// CCoronas::Render
+	{0x7241C0, {0}, {0}, 0},	// CBrightLights::Render
+	{0x724890, {0}, {0}, 0},	// CShinyTexts::Render
+	{0x725040, {0}, {0}, 0},	// C3dMarkers::Render
+};
+static int sfxW2Dinstalled;
+static int sfxWorld2DDrawn;	// overlays already drawn early this frame
+static int sfxW2Dlogs;
+
+static void
+sfxW2Dwrite(int i, const unsigned char *bytes)
+{
+	DWORD old;
+	VirtualProtect((void*)sfxW2Dhooks[i].addr, 5, PAGE_EXECUTE_READWRITE, &old);
+	memcpy((void*)sfxW2Dhooks[i].addr, bytes, 5);
+	VirtualProtect((void*)sfxW2Dhooks[i].addr, 5, old, &old);
+}
+
+// run the original body with the hook temporarily removed
+static void
+sfxW2DcallOrig(int i)
+{
+	sfxW2Dwrite(i, sfxW2Dhooks[i].orig);
+	((sfxVoidCall)sfxW2Dhooks[i].addr)();
+	sfxW2Dwrite(i, sfxW2Dhooks[i].jmp);
+}
+
+static void sfxW2Dcoronas(void){ if(!sfxWorld2DDrawn) sfxW2DcallOrig(0); }
+static void sfxW2Dbright(void){ if(!sfxWorld2DDrawn) sfxW2DcallOrig(1); }
+static void sfxW2Dshiny(void){ if(!sfxWorld2DDrawn) sfxW2DcallOrig(2); }
+static void sfxW2Dmarkers(void){ if(!sfxWorld2DDrawn) sfxW2DcallOrig(3); }
+
+static void
+sfxW2Dinstall(void)
+{
+	void *hooks[4] = {
+		(void*)sfxW2Dcoronas, (void*)sfxW2Dbright,
+		(void*)sfxW2Dshiny, (void*)sfxW2Dmarkers
+	};
+	int i;
+	if(sfxW2Dinstalled)
+		return;
+	sfxW2Dinstalled = 1;
+	for(i = 0; i < 4; i++){
+		SfxW2DHook *h = &sfxW2Dhooks[i];
+		memcpy(h->orig, (void*)h->addr, 5);
+		if(h->orig[0] == 0xE9){
+			// something else hooked this function already - leave it alone
+			sfxLogLine("install: world2d %d @%08x skip - already hooked\n", i, h->addr);
+			continue;
+		}
+		InjectHook(h->addr, hooks[i], PATCH_JUMP);
+		memcpy(h->jmp, (void*)h->addr, 5);
+		if(h->jmp[0] != 0xE9 || memcmp(h->jmp, h->orig, 5) == 0){
+			sfxW2Dwrite(i, h->orig);
+			sfxLogLine("install: world2d %d @%08x ABORT - patch did not take\n", i, h->addr);
+			continue;
+		}
+		h->ok = 1;
+	}
+	sfxLogLine("install: world2d ok=%d%d%d%d (coronas bright shiny markers)\n",
+		sfxW2Dhooks[0].ok, sfxW2Dhooks[1].ok,
+		sfxW2Dhooks[2].ok, sfxW2Dhooks[3].ok);
+}
+
 void
 RenderScale_Begin(void)
 {
 	float s = config->renderScale;
 	if(s < 0.5f)
 		s = 0.5f;
+	sfxWorld2DDrawn = 0;
 	if(s >= 1.0f){
 		sfxScaleActive = 0;
 		sfxScaleApplied = 0;
@@ -1761,6 +1850,7 @@ RenderScale_Begin(void)
 		sfxScaleApplied = 0;
 		return;
 	}
+	sfxW2Dinstall();
 	sfxScaleW = w;
 	sfxScaleH = h;
 	sfxSceneW = camR->width;
@@ -1822,6 +1912,24 @@ RenderScale_EndOfScene(void)
 	}
 	// camera back on the full raster - RW re-issues the full-size viewport
 	setSceneRaster(camR);
+	// v9.7: draw the z-tested world overlays now, before the stretch -
+	// after it their depth no longer matches the colour frame and night
+	// lights shine through buildings (see the note above sfxW2Dhooks)
+	if(sfxW2Dinstalled){
+		int i, n = 0;
+		sfxWorld2DDrawn = 0;
+		for(i = 0; i < 4; i++){
+			if(sfxW2Dhooks[i].ok){
+				((sfxVoidCall)sfxW2Dhooks[i].addr)();
+				n++;
+			}
+		}
+		sfxWorld2DDrawn = 1;
+		if(n > 0 && sfxW2Dlogs < 8){
+			sfxW2Dlogs++;
+			sfxLogLine("M world2d pre-stretch: %d overlays drawn\n", n);
+		}
+	}
 	// 1:1 copy of the frame into the scratch raster (the camera raster is
 	// the back buffer and can not be sampled as a texture - that was the
 	// v9.1 white screen)
