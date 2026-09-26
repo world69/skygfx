@@ -1597,6 +1597,13 @@ static FILE *sfxLog;
 static int sfxLogCount;
 static int sfxLogV0, sfxLogT0, sfxLogOther; // caps for off-window events
 static int sfxLogT, sfxLogC, sfxLogS, sfxLogP; // caps for in-window events
+// v9.9: while the pre-stretch overlay pass runs, the vtable hooks must
+// keep enforcing the scaled viewport exactly like during the scene -
+// RW (Im3D/pipeline draws) can re-issue the camera's full-size viewport
+// mid-pass, which silently undid v9.8's scaled one. sfxW2DPass marks
+// that window for the vp-fix counter in the SetViewport hook.
+static int sfxW2DPass;
+static int sfxW2DVpFix;
 static void
 sfxLogLine(const char *fmt, ...)
 {
@@ -1606,7 +1613,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.8) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.9) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -1658,6 +1665,8 @@ sfxSetViewportHook(void *dev, void *vp)
 	if(sfxScaleActive){
 		if(v->width == sfxSceneW && v->height == sfxSceneH){
 			struct SfxD3DViewport c = {0, 0, sfxScaleW, sfxScaleH, 0.0f, 1.0f};
+			if(sfxW2DPass)
+				sfxW2DVpFix++;
 			if(sfxLogC++ < 16)
 				sfxLogLine("%c vp=%ux%u -> %ux%u\n",
 					sfxScaleInScene ? 'C' : 'H',
@@ -1955,6 +1964,16 @@ RenderScale_EndOfScene(void)
 		// sub-rect (the state RW left after the scene render)
 		struct SfxD3DViewport svp = {0, 0, (unsigned int)sfxScaleW, (unsigned int)sfxScaleH, 0.0f, 1.0f};
 		d3dSetViewportOrig(d3d9device, &svp);
+		// v9.9: re-arm the vtable enforcement for the duration of the pass.
+		// RW re-issues the camera's full-size viewport while the overlays
+		// draw (Im3D/pipeline state changes); with sfxScaleActive back on,
+		// every such full-size SetViewport is rewritten to the sub-rect
+		// again instead of silently undoing the one above (that was the
+		// v9.8 failure), and projection changes re-assert it as in-scene.
+		sfxScaleActive = 1;
+		sfxScaleInScene = 1;
+		sfxW2DPass = 1;
+		sfxW2DVpFix = 0;
 		// raster-space maths (coronas, flares) must produce sub-rect
 		// coordinates as well - lie about the screen and raster size
 		Scene.camera->frameBuffer = sfxW2DDimsRaster;
@@ -1968,6 +1987,9 @@ RenderScale_EndOfScene(void)
 			}
 		}
 		sfxWorld2DDrawn = 1;
+		sfxW2DPass = 0;
+		sfxScaleInScene = 0;
+		sfxScaleActive = 0;
 		// everything back to normal before any further RW context call
 		RsGlobal->MaximumWidth = savedRsW;
 		RsGlobal->MaximumHeight = savedRsH;
@@ -1976,8 +1998,8 @@ RenderScale_EndOfScene(void)
 		d3dSetViewportOrig(d3d9device, &fullvp);
 		if(n > 0 && sfxW2Dlogs < 8){
 			sfxW2Dlogs++;
-			sfxLogLine("M world2d pre-stretch: %d overlays, vp+dims %dx%d\n",
-				n, sfxScaleW, sfxScaleH);
+			sfxLogLine("M world2d pre-stretch: %d overlays, vp+dims %dx%d vpfix %d\n",
+				n, sfxScaleW, sfxScaleH, sfxW2DVpFix);
 		}
 	}
 	// 1:1 copy of the frame into the scratch raster (the camera raster is
