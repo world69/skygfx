@@ -1606,7 +1606,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.7) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.8) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -1734,20 +1734,30 @@ sfxScaleInstallVtableHook(void)
 }
 
 // ---------------------------------------------------------------------------
-// v9.7: the night world overlays that depth-test against the scene
+// v9.8: the night world overlays that depth-test against the scene
 // (CCoronas::Render - street/car lamp coronas, CBrightLights::Render -
 // building windows, CShinyTexts::Render - neon signs, C3dMarkers::Render)
-// must be drawn BEFORE the end-of-scene stretch. The scene renders into
-// the top-left sfxScaleW x sfxScaleH of the back buffer and only the
-// colour is stretched to full size; the depth buffer stays in the
-// sub-rect layout. Anything z-tested that is drawn after the stretch
-// compares against that stale depth map and pops in front of nearby
-// geometry - the "lights shine through buildings at night" bug at
-// renderScale < 1.0. So run the real render functions right before the
-// stretch, while their depth is still consistent with the scene, and
-// swallow the game's own (now duplicate) calls for the rest of the
-// frame. When renderScale is 1.0 nothing is ever flagged drawn and the
-// hooks just pass through.
+// must be drawn BEFORE the end-of-scene stretch AND in the sub-rect
+// coordinate space. The scene renders into the top-left sfxScaleW x
+// sfxScaleH of the back buffer and only the colour is stretched to full
+// size; the depth buffer stays in the sub-rect layout. The overlays use
+// three different coordinate sources, so all three have to point into
+// the sub-rect while they are drawn early:
+//  - pipeline and RwIm3D draws (shiny texts, bright lights, markers)
+//    follow the D3D viewport;
+//  - CSprite::CalcScreenCoors, which positions the coronas, scales by
+//    RsGlobal->MaximumWidth/Height (the SCREEN_WIDTH/HEIGHT macros);
+//  - anything reading RwCameraGetRaster(Scene.camera) follows the
+//    camera raster dims (flare layout, off-screen culling).
+// Drawn after the stretch their z no longer matches the colour frame -
+// the "lights shine through buildings at night" bug at renderScale < 1.0
+// (v9.7 already drew them early, but still in full-raster coordinates,
+// so the lights moved with the stretch and z-tested against the wrong
+// pixels). The hooks below let skygfx run the real render functions
+// right before the stretch with viewport/raster/RsGlobal shrunk to the
+// sub-rect, and swallow the game's own (now duplicate) calls for the
+// rest of the frame. When renderScale is 1.0 nothing is ever flagged
+// drawn and the hooks just pass through.
 typedef void (*sfxVoidCall)();
 struct SfxW2DHook {
 	unsigned int addr;		// game function, 1.0 US
@@ -1764,6 +1774,23 @@ static SfxW2DHook sfxW2Dhooks[4] = {
 static int sfxW2Dinstalled;
 static int sfxWorld2DDrawn;	// overlays already drawn early this frame
 static int sfxW2Dlogs;
+static RwRaster *sfxW2DDimsRaster;	// sub-rect sized raster - only its
+static int sfxW2DDimsW, sfxW2DDimsH;	// width/height are ever read
+
+static RwRaster *
+ensureW2DDimsRaster(int w, int h, RwInt32 depth)
+{
+	if(sfxW2DDimsRaster && sfxW2DDimsW == w && sfxW2DDimsH == h)
+		return sfxW2DDimsRaster;
+	if(sfxW2DDimsRaster)
+		RwRasterDestroy(sfxW2DDimsRaster);
+	sfxW2DDimsRaster = RwRasterCreate(w, h, depth, rwRASTERTYPECAMERATEXTURE);
+	if(!sfxW2DDimsRaster)
+		return nil;
+	sfxW2DDimsW = w;
+	sfxW2DDimsH = h;
+	return sfxW2DDimsRaster;
+}
 
 static void
 sfxW2Dwrite(int i, const unsigned char *bytes)
@@ -1912,11 +1939,27 @@ RenderScale_EndOfScene(void)
 	}
 	// camera back on the full raster - RW re-issues the full-size viewport
 	setSceneRaster(camR);
-	// v9.7: draw the z-tested world overlays now, before the stretch -
-	// after it their depth no longer matches the colour frame and night
-	// lights shine through buildings (see the note above sfxW2Dhooks)
-	if(sfxW2Dinstalled){
+	// v9.8: draw the z-tested world overlays now, before the stretch, in
+	// the sub-rect coordinate space (see the note above sfxW2Dhooks):
+	// scaled D3D viewport for the pipeline/Im3D passes, camera raster
+	// dims and RsGlobal screen size shrunk for the raster-space sprite
+	// maths (CSprite::CalcScreenCoors). After the stretch none of that
+	// would match the sub-rect depth buffer any more.
+	if(sfxW2Dinstalled
+		&& ensureW2DDimsRaster(sfxScaleW, sfxScaleH, camR->depth)){
 		int i, n = 0;
+		RwRaster *savedFB = Scene.camera->frameBuffer;
+		DWORD savedRsW = RsGlobal->MaximumWidth;
+		DWORD savedRsH = RsGlobal->MaximumHeight;
+		// pipeline/Im3D draws follow the viewport - put it back on the
+		// sub-rect (the state RW left after the scene render)
+		struct SfxD3DViewport svp = {0, 0, (unsigned int)sfxScaleW, (unsigned int)sfxScaleH, 0.0f, 1.0f};
+		d3dSetViewportOrig(d3d9device, &svp);
+		// raster-space maths (coronas, flares) must produce sub-rect
+		// coordinates as well - lie about the screen and raster size
+		Scene.camera->frameBuffer = sfxW2DDimsRaster;
+		RsGlobal->MaximumWidth = (DWORD)sfxScaleW;
+		RsGlobal->MaximumHeight = (DWORD)sfxScaleH;
 		sfxWorld2DDrawn = 0;
 		for(i = 0; i < 4; i++){
 			if(sfxW2Dhooks[i].ok){
@@ -1925,9 +1968,16 @@ RenderScale_EndOfScene(void)
 			}
 		}
 		sfxWorld2DDrawn = 1;
+		// everything back to normal before any further RW context call
+		RsGlobal->MaximumWidth = savedRsW;
+		RsGlobal->MaximumHeight = savedRsH;
+		Scene.camera->frameBuffer = savedFB;
+		struct SfxD3DViewport fullvp = {0, 0, (unsigned int)camR->width, (unsigned int)camR->height, 0.0f, 1.0f};
+		d3dSetViewportOrig(d3d9device, &fullvp);
 		if(n > 0 && sfxW2Dlogs < 8){
 			sfxW2Dlogs++;
-			sfxLogLine("M world2d pre-stretch: %d overlays drawn\n", n);
+			sfxLogLine("M world2d pre-stretch: %d overlays, vp+dims %dx%d\n",
+				n, sfxScaleW, sfxScaleH);
 		}
 	}
 	// 1:1 copy of the frame into the scratch raster (the camera raster is
