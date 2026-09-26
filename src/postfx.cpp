@@ -1592,7 +1592,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.4) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.5) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -1766,6 +1766,25 @@ RenderScale_Begin(void)
 		s, sfxSceneW, sfxSceneH, sfxVpFull.width, sfxVpFull.height, w, h);
 }
 
+// full-size scratch raster for the stretch pass (same recipe as the bloom
+// buffers: recreate when the size or depth of the front buffer changes)
+static RwRaster *
+ensureStretchRaster(int w, int h, RwInt32 depth)
+{
+	if(sfxStretchRaster && sfxStretchW == w && sfxStretchH == h
+			&& sfxStretchDepth == depth)
+		return sfxStretchRaster;
+	if(sfxStretchRaster)
+		RwRasterDestroy(sfxStretchRaster);
+	sfxStretchRaster = RwRasterCreate(w, h, depth, rwRASTERTYPECAMERATEXTURE);
+	if(!sfxStretchRaster)
+		return nil;
+	sfxStretchW = w;
+	sfxStretchH = h;
+	sfxStretchDepth = depth;
+	return sfxStretchRaster;
+}
+
 // Called from RenderScene_after() once the 3D scene pass is done: close the
 // window, take the full viewport back and immediately stretch the scaled
 // rectangle over the whole raster. The game then draws its HUD and every
@@ -1828,25 +1847,6 @@ RenderScale_EndOfScene(void)
 	sfxVpScaled = 0;
 	sfxLogLine("R stretch %ux%u -> %ux%u\n",
 		sfxScaleW, sfxScaleH, camR->width, camR->height);
-}
-
-// full-size scratch raster for the stretch pass (same recipe as the bloom
-// buffers: recreate when the size or depth of the front buffer changes)
-static RwRaster *
-ensureStretchRaster(int w, int h, RwInt32 depth)
-{
-	if(sfxStretchRaster && sfxStretchW == w && sfxStretchH == h
-			&& sfxStretchDepth == depth)
-		return sfxStretchRaster;
-	if(sfxStretchRaster)
-		RwRasterDestroy(sfxStretchRaster);
-	sfxStretchRaster = RwRasterCreate(w, h, depth, rwRASTERTYPECAMERATEXTURE);
-	if(!sfxStretchRaster)
-		return nil;
-	sfxStretchW = w;
-	sfxStretchH = h;
-	sfxStretchDepth = depth;
-	return sfxStretchRaster;
 }
 
 void
