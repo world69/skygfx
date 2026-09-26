@@ -1516,53 +1516,49 @@ RwRaster *scaleRaster;
 RwTexture *scaleTexture;
 RwRaster *scaleSavedRaster;
 static int scaleLastW, scaleLastH, scaleLastDepth;
-static uint8 sfxScaleActive, sfxScaleVtPatched, sfxScaleVtTried, sfxProjRemapped;
+static uint8 sfxScaleActive, sfxScaleVtPatched, sfxScaleVtTried, sfxVpClamped;
 static float sfxScaleS;
 
-// While the low-res raster is the scene target, the D3D viewport stays at the
-// back buffer size (the game (re)sets it after our before-scene hook), so a
-// full-size NDC frame only keeps its top-left s x s corner in the small
-// raster - which shows up as a zoomed crop. We therefore remap every
-// projection matrix that reaches the device during the scene pass so the
-// full FOV lands in that corner:
-//   x' = s*x + (s-1)   maps NDC [-1,1] onto [-1, 2s-1] (left s part)
-//   y' = s*y + (1-s)   maps NDC [-1,1] onto [1-2s, 1]  (top s part)
-// A constant NDC offset can only be expressed pre-division through the z
-// term (w = m[3][2]*z), hence the m[0][2] / m[1][2] adjustments.
+// While the low-res raster is the scene target, the D3D viewport still
+// holds the full back buffer size (it was set from the old raster / the
+// back buffer before the swap, and the game may reset it during the pass),
+// so the device only keeps the top-left s x s corner of the NDC frame in
+// the small raster - which shows up as a zoomed crop.
+// Remapping projection matrices never had any effect because the game does
+// not re-set the projection while the small target is bound (the v7 log
+// proved it: "install: OK" but zero SetViewport/SetTransform events - the
+// v7 hook additionally sat on the wrong vtable slots). The fix is direct:
+// clamp the viewport itself to the low-res raster size while the scale
+// window is open - same projection, same FOV, just fewer pixels - and
+// hand the saved full viewport back when the window closes so the
+// reflection/env passes and the final composite keep normal D3D state.
 struct SfxD3DViewport
 {
 	long x, y;
 	unsigned int width, height;
-};
-// D3D9 device vtable slots (stable, standard DirectX9 layout):
-//   8  = SetViewport(const D3DVIEWPORT9 *)
-//   9  = GetViewport(D3DVIEWPORT9 *)
-//   15 = SetTransform(int type, const D3DMATRIX *)
-//   16 = GetTransform(int type, D3DMATRIX *)
+	float minz, maxz;
+}; // D3DVIEWPORT9 is 24 bytes - GetViewport() writes all of it
+static struct SfxD3DViewport sfxVpFull;
+
+// D3D9 device vtable slots (IDirect3DDevice9 layout, d3d9.h order:
+// ... EndScene=42, Clear=43, then):
+//   44 = SetTransform(int type, const D3DMATRIX *)
+//   45 = GetTransform(int type, D3DMATRIX *)
+//   47 = SetViewport(const D3DVIEWPORT9 *)
+//   48 = GetViewport(D3DVIEWPORT9 *)
+// Earlier revisions hooked 8/9/15/16, which are GetDisplayMode /
+// GetCreationParameters / GetNumberOfSwapChains / Reset - that is why the
+// v7 log showed "install: OK" but never a single viewport/transform event.
 // Device methods are declared without D3D9 SDK types (the plugin SDK
 // include chain does not reliably provide the interfaces in this
 // translation unit): opaque pointers + x86 __stdcall only.
-// D3DVIEWPORT9 layout: { LONG x, y; DWORD Width, Height; } (16 bytes)
-// D3DMATRIX layout:    { float m[4][4]; }
-// D3DTS_PROJECTION = 2, D3D_OK = 0
+// D3DMATRIX layout: { float m[4][4]; }
+// D3DTS_VIEW = 2, D3DTS_PROJECTION = 3, D3D_OK = 0
 typedef int (__stdcall *sfxD3D2ArgFn)(void *, void *);
 typedef int (__stdcall *sfxD3D3ArgFn)(void *, int, void *);
 static sfxD3D2ArgFn d3dSetViewportOrig;
 static sfxD3D2ArgFn d3dGetViewport;
 static sfxD3D3ArgFn d3dSetTransformOrig;
-static sfxD3D3ArgFn d3dGetTransform;
-
-// remap the 4x4 float projection matrix in place (see formula above)
-static void
-sfxRemapProjection(float (*mm)[4])
-{
-	float s = sfxScaleS;
-	float p32 = mm[3][2];
-	mm[0][0] = s * mm[0][0];
-	mm[1][1] = s * mm[1][1];
-	mm[0][2] += (s - 1.0f) * p32;
-	mm[1][2] += (1.0f - s) * p32;
-}
 
 // the viewport is wider than the low-res raster (full back buffer size)
 static bool
@@ -1577,6 +1573,7 @@ sfxViewportOverRaster(const struct SfxD3DViewport *vp)
 // skygfx_renderScale.log in the game folder (first 20000 lines) ---
 static FILE *sfxLog;
 static int sfxLogCount;
+static int sfxLogV0, sfxLogT0, sfxLogOther; // caps for off-window events
 static void
 sfxLogLine(const char *fmt, ...)
 {
@@ -1586,7 +1583,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v7) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v8) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -1596,60 +1593,46 @@ sfxLogLine(const char *fmt, ...)
 		fflush(sfxLog);
 }
 
-// NOTE: the remap must be applied exactly ONCE per stored projection
-// matrix. sfxProjRemapped tracks whether the matrix currently in the
-// device is already remapped, no matter in which order the game issues
-// SetTransform / SetViewport during the scene pass (remapping twice
-// squashes the FOV to s*s and shifts the frame).
+// diagnostics only: the projection matrix itself is never modified (the
+// viewport clamp below is the entire fix) - we just record what the game
+// issues and while the scale window is open. D3DTS_PROJECTION = 3; the
+// old code tested for 2, which is D3DTS_VIEW.
 static int __stdcall
 sfxSetTransformHook(void *dev, int type, void *m)
 {
-	if(type == 2 /* D3DTS_PROJECTION */ && sfxScaleActive){
-		struct SfxD3DViewport vp;
-		int got = (d3dGetViewport(dev, &vp) == 0 /* D3D_OK */);
-		if(got && sfxViewportOverRaster(&vp)){
-			// the viewport is at the full back buffer size while the
-			// target is the small raster: remap this (fresh) matrix so
-			// the full FOV fits the kept corner
-			float mm[16];
-			int i;
-			for(i = 0; i < 16; i++)
-				mm[i] = ((float*)m)[i];
-			sfxRemapProjection((float(*)[4])mm);
-			sfxProjRemapped = 1;
-			sfxLogLine("T proj set, vp=%ux%u -> REMAPPED\n", vp.width, vp.height);
-			return d3dSetTransformOrig(dev, type, mm);
-		}
-		// the viewport fits the raster: the stored matrix is unremapped
-		sfxProjRemapped = 0;
-		if(got)
-			sfxLogLine("t proj set, vp=%ux%u -> raw\n", vp.width, vp.height);
-	}
+	if(type == 3 /* D3DTS_PROJECTION */){
+		if(sfxScaleActive)
+			sfxLogLine("T proj win=1\n");
+		else if(sfxLogT0++ < 8)
+			sfxLogLine("T0 proj win=0\n");
+	}else if(sfxLogOther++ < 6)
+		sfxLogLine("t type=%d win=%d\n", type, (int)sfxScaleActive);
 	return d3dSetTransformOrig(dev, type, m);
 }
 
+// the whole fix: while the scale window is open, every viewport that is
+// wider than the low-res raster gets clamped to the raster size before it
+// reaches the device - full FOV in the small target, no zoom, no matrix
+// tricks, no matter who resets the viewport and when
 static int __stdcall
 sfxSetViewportHook(void *dev, void *vp)
 {
-	int hr = d3dSetViewportOrig(dev, vp);
-	const struct SfxD3DViewport *v = (const struct SfxD3DViewport*)vp;
-	if(sfxScaleActive){
-		if(sfxViewportOverRaster(v) && !sfxProjRemapped){
-			// the viewport was widened over the small raster (the game
-			// does this at scene start) and the stored projection is
-			// still the game's raw matrix: remap it - but never twice
-			float mm[16];
-			if(d3dGetTransform(dev, 2 /* D3DTS_PROJECTION */, mm) == 0 /* D3D_OK */){
-				sfxRemapProjection((float(*)[4])mm);
-				d3dSetTransformOrig(dev, 2 /* D3DTS_PROJECTION */, mm);
-				sfxProjRemapped = 1;
-			}
-		}
-		sfxLogLine("%c vp=%ux%u remapped=%d\n",
-			sfxViewportOverRaster(v) ? 'V' : 'v',
-			v->width, v->height, (int)sfxProjRemapped);
+	struct SfxD3DViewport *v = (struct SfxD3DViewport*)vp;
+	if(sfxScaleActive && sfxViewportOverRaster(v)){
+		sfxVpFull = *v;
+		struct SfxD3DViewport c = *v;
+		c.width = (unsigned int)scaleRaster->width;
+		c.height = (unsigned int)scaleRaster->height;
+		sfxVpClamped = 1;
+		sfxLogLine("C vp=%ux%u -> %ux%u\n",
+			v->width, v->height, c.width, c.height);
+		return d3dSetViewportOrig(dev, &c);
 	}
-	return hr;
+	if(sfxScaleActive)
+		sfxLogLine("v vp=%ux%u\n", v->width, v->height);
+	else if(sfxLogV0++ < 16)
+		sfxLogLine("V0 vp=%ux%u\n", v->width, v->height);
+	return d3dSetViewportOrig(dev, vp);
 }
 
 static void
@@ -1666,18 +1649,20 @@ sfxScaleInstallVtableHook(void)
 		sfxScaleVtTried = 1;
 		return;
 	}
-	d3dSetViewportOrig = (sfxD3D2ArgFn)vt[8];
-	d3dGetViewport = (sfxD3D2ArgFn)vt[9];
-	d3dSetTransformOrig = (sfxD3D3ArgFn)vt[15];
-	d3dGetTransform = (sfxD3D3ArgFn)vt[16];
-	sfxLogLine("install: orig slot8=%08x slot9=%08x slot15=%08x slot16=%08x\n",
-		(unsigned int)(void*)d3dSetViewportOrig, (unsigned int)(void*)d3dGetViewport,
-		(unsigned int)(void*)d3dSetTransformOrig, (unsigned int)(void*)d3dGetTransform);
+	d3dSetTransformOrig = (sfxD3D3ArgFn)vt[44];
+	d3dSetViewportOrig = (sfxD3D2ArgFn)vt[47];
+	d3dGetViewport = (sfxD3D2ArgFn)vt[48];
+	sfxLogLine("install: orig SetTransform44=%08x SetViewport47=%08x GetViewport48=%08x\n",
+		(unsigned int)(void*)d3dSetTransformOrig,
+		(unsigned int)(void*)d3dSetViewportOrig,
+		(unsigned int)(void*)d3dGetViewport);
 	// plausibility check: the "original" methods must be normal 32-bit
 	// code pointers. No module is assumed here: a d3d9-on-d12 style
 	// wrapper may implement the device in a different module.
 	if((unsigned int)(void*)d3dSetViewportOrig < 0x10000
 		|| (unsigned int)(void*)d3dSetViewportOrig >= 0x80000000
+		|| (unsigned int)(void*)d3dGetViewport < 0x10000
+		|| (unsigned int)(void*)d3dGetViewport >= 0x80000000
 		|| (unsigned int)(void*)d3dSetTransformOrig < 0x10000
 		|| (unsigned int)(void*)d3dSetTransformOrig >= 0x80000000){
 		sfxLogLine("install: ABORT - original pointers not plausible\n");
@@ -1686,26 +1671,27 @@ sfxScaleInstallVtableHook(void)
 	}
 	// the vtable lives in a read-only section, so its page has to be
 	// made writable just for the patch and restored afterwards
-	size_t span = (size_t)((char*)&vt[16] - (char*)&vt[8]);
+	size_t span = (size_t)((char*)&vt[48] - (char*)&vt[44]);
 	DWORD oldProt = 0;
-	if(!VirtualProtect(&vt[8], span, PAGE_READWRITE, &oldProt)){
+	if(!VirtualProtect(&vt[44], span, PAGE_READWRITE, &oldProt)){
 		sfxLogLine("install: ABORT - VirtualProtect failed (err=%u)\n",
 			(unsigned int)GetLastError());
 		sfxScaleVtTried = 1;
 		return;
 	}
-	Patch((void*)(&vt[15]), (void*)sfxSetTransformHook);
-	Patch((void*)(&vt[8]), (void*)sfxSetViewportHook);
-	VirtualProtect(&vt[8], span, oldProt, &oldProt);
+	Patch((void*)(&vt[47]), (void*)sfxSetViewportHook);
+	Patch((void*)(&vt[44]), (void*)sfxSetTransformHook);
+	VirtualProtect(&vt[44], span, oldProt, &oldProt);
 	// verify the entries really took (read them back through the table)
-	if(vt[15] != (void*)sfxSetTransformHook || vt[8] != (void*)sfxSetViewportHook){
-		sfxLogLine("install: ABORT - readback mismatch slot8=%08x slot15=%08x\n",
-			(unsigned int)(void*)vt[8], (unsigned int)(void*)vt[15]);
+	if(vt[47] != (void*)sfxSetViewportHook || vt[44] != (void*)sfxSetTransformHook){
+		sfxLogLine("install: ABORT - readback mismatch s44=%08x s47=%08x\n",
+			(unsigned int)(void*)vt[44], (unsigned int)(void*)vt[47]);
 		sfxScaleVtTried = 1;
 		return;
 	}
-	sfxLogLine("install: OK - vtable hooked slot8=%08x slot15=%08x\n",
-		(unsigned int)(void*)sfxSetViewportHook, (unsigned int)(void*)sfxSetTransformHook);
+	sfxLogLine("install: OK - vtable hooked SetTransform44=%08x SetViewport47=%08x\n",
+		(unsigned int)(void*)sfxSetTransformHook,
+		(unsigned int)(void*)sfxSetViewportHook);
 	sfxScaleVtPatched = 1;
 	sfxScaleVtTried = 1;
 }
@@ -1757,19 +1743,50 @@ RenderScale_Begin(void)
 		return;
 	}
 	scaleSavedRaster = camR;
-	setSceneRaster(sr);
 	sfxScaleInstallVtableHook();
-	sfxScaleS = s;
+	// open the window BEFORE the raster swap so the SetViewport/SetTransform
+	// calls inside setSceneRaster's RwCameraBeginUpdate are covered too
 	sfxScaleActive = 1;
-	sfxLogLine("B begin: scale=%.2f raster=%dx%d\n", sfxScaleS, w, h);
+	setSceneRaster(sr);
+	// belt and braces: clamp whatever viewport the camera update just set -
+	// this also covers the case where nothing inside the scene ever calls
+	// SetViewport again (exactly what the v7 log showed)
+	struct SfxD3DViewport vp;
+	if(sfxScaleVtPatched && d3dGetViewport && d3dGetViewport(d3d9device, &vp) == 0){
+		if(sfxViewportOverRaster(&vp)){
+			sfxVpFull = vp;
+			vp.width = (unsigned int)sr->width;
+			vp.height = (unsigned int)sr->height;
+			sfxVpClamped = 1;
+			if(d3dSetViewportOrig)
+				d3dSetViewportOrig(d3d9device, &vp);
+			sfxLogLine("B begin: scale=%.2f raster=%dx%d vp=%ux%u -> clamped\n",
+				s, w, h, (unsigned int)sr->width, (unsigned int)sr->height);
+		}else
+			sfxLogLine("B begin: scale=%.2f raster=%dx%d vp=%ux%u ok\n",
+				s, w, h, vp.width, vp.height);
+	}else
+		sfxLogLine("B begin: scale=%.2f raster=%dx%d vp=?\n", s, w, h);
 }
 
 // Called from RenderScene_after() once the 3D scene pass is done: the
 // reflection/env passes and the game's own post effects must run with normal
-// D3D state, so the projection remap is suspended from here on
+// D3D state, so the scale window is closed here - including handing the
+// full back buffer viewport back (the composite draws full-size im2d quads)
 void
 RenderScale_EndOfScene(void)
 {
+	if(sfxVpClamped){
+		struct SfxD3DViewport cur;
+		sfxVpClamped = 0;
+		if(sfxScaleVtPatched && d3dGetViewport && d3dSetViewportOrig
+				&& d3dGetViewport(d3d9device, &cur) == 0 && scaleRaster
+				&& cur.width == (unsigned int)scaleRaster->width
+				&& cur.height == (unsigned int)scaleRaster->height){
+			d3dSetViewportOrig(d3d9device, &sfxVpFull);
+			sfxLogLine("R vp restored %ux%u\n", sfxVpFull.width, sfxVpFull.height);
+		}
+	}
 	sfxScaleActive = 0;
 }
 
