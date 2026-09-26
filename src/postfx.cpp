@@ -1616,7 +1616,7 @@ sfxScaleInstallVtableHook(void)
 		return;
 	// the vtable is the FIRST member of the device object; the object
 	// itself must never be written (earlier revisions corrupted it)
-	void **vt = *(void**)d3d9device;
+	void **vt = (void**)(*(void**)d3d9device);
 	if(vt == nil)
 		return;
 	d3dSetViewportOrig = (sfxD3D2ArgFn)vt[8];
@@ -1632,8 +1632,8 @@ sfxScaleInstallVtableHook(void)
 	IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS*)((char*)hD3D9 + dos->e_lfanew);
 	int lo = (int)hD3D9;
 	int hi = (int)hD3D9 + (int)nt->OptionalHeader.SizeOfImage;
-	if((int)d3dSetViewportOrig < lo || (int)d3dSetViewportOrig >= hi
-		|| (int)d3dSetTransformOrig < lo || (int)d3dSetTransformOrig >= hi){
+	if((int)(void*)d3dSetViewportOrig < lo || (int)(void*)d3dSetViewportOrig >= hi
+		|| (int)(void*)d3dSetTransformOrig < lo || (int)(void*)d3dSetTransformOrig >= hi){
 		sfxScaleVtTried = 1;
 		return;
 	}
