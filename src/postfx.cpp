@@ -1,5 +1,6 @@
 #include "skygfx.h"
 #include "ModuleList.hpp"
+#include <stdarg.h>
 
 RwIm2DVertex *colorfilterVerts = (RwIm2DVertex*)0xC400D8;
 RwImVertexIndex *colorfilterIndices = (RwImVertexIndex*)0x8D5174;
@@ -1572,13 +1573,12 @@ sfxViewportOverRaster(const struct SfxD3DViewport *vp)
 			|| vp->height > (unsigned int)scaleRaster->height);
 }
 
-// optional diagnostics: when renderScaleDebugLog=1, append the D3D
-// viewport/projection events that happen while the remap is active to
-// skygfx_renderScale.log in the game folder (first 20000 events)
+// --- diagnostics (renderScaleDebugLog=1): append D3D state events to
+// skygfx_renderScale.log in the game folder (first 20000 lines) ---
 static FILE *sfxLog;
 static int sfxLogCount;
 static void
-sfxLogEvent(char what, int remapped)
+sfxLogLine(const char *fmt, ...)
 {
 	if(!config->renderScaleDebugLog || sfxLogCount >= 20000)
 		return;
@@ -1586,9 +1586,12 @@ sfxLogEvent(char what, int remapped)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== renderScale log, scale=%.2f ====\n", sfxScaleS);
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v7) ====\n");
 	}
-	fprintf(sfxLog, "%06d %c remapped=%d\n", sfxLogCount, what, remapped);
+	va_list ap;
+	va_start(ap, fmt);
+	vfprintf(sfxLog, fmt, ap);
+	va_end(ap);
 	if((++sfxLogCount % 32) == 0)
 		fflush(sfxLog);
 }
@@ -1603,7 +1606,8 @@ sfxSetTransformHook(void *dev, int type, void *m)
 {
 	if(type == 2 /* D3DTS_PROJECTION */ && sfxScaleActive){
 		struct SfxD3DViewport vp;
-		if(d3dGetViewport(dev, &vp) == 0 /* D3D_OK */ && sfxViewportOverRaster(&vp)){
+		int got = (d3dGetViewport(dev, &vp) == 0 /* D3D_OK */);
+		if(got && sfxViewportOverRaster(&vp)){
 			// the viewport is at the full back buffer size while the
 			// target is the small raster: remap this (fresh) matrix so
 			// the full FOV fits the kept corner
@@ -1613,12 +1617,13 @@ sfxSetTransformHook(void *dev, int type, void *m)
 				mm[i] = ((float*)m)[i];
 			sfxRemapProjection((float(*)[4])mm);
 			sfxProjRemapped = 1;
-			sfxLogEvent('T', 1);
+			sfxLogLine("T proj set, vp=%ux%u -> REMAPPED\n", vp.width, vp.height);
 			return d3dSetTransformOrig(dev, type, mm);
 		}
 		// the viewport fits the raster: the stored matrix is unremapped
 		sfxProjRemapped = 0;
-		sfxLogEvent('t', 0);
+		if(got)
+			sfxLogLine("t proj set, vp=%ux%u -> raw\n", vp.width, vp.height);
 	}
 	return d3dSetTransformOrig(dev, type, m);
 }
@@ -1628,11 +1633,11 @@ sfxSetViewportHook(void *dev, void *vp)
 {
 	int hr = d3dSetViewportOrig(dev, vp);
 	const struct SfxD3DViewport *v = (const struct SfxD3DViewport*)vp;
-	if(sfxScaleActive && sfxViewportOverRaster(v)){
-		// the viewport was widened over the small raster (the game does
-		// this at scene start); if the stored projection is still the
-		// game's raw matrix, remap it - but never remap twice
-		if(!sfxProjRemapped){
+	if(sfxScaleActive){
+		if(sfxViewportOverRaster(v) && !sfxProjRemapped){
+			// the viewport was widened over the small raster (the game
+			// does this at scene start) and the stored projection is
+			// still the game's raw matrix: remap it - but never twice
 			float mm[16];
 			if(d3dGetTransform(dev, 2 /* D3DTS_PROJECTION */, mm) == 0 /* D3D_OK */){
 				sfxRemapProjection((float(*)[4])mm);
@@ -1640,7 +1645,9 @@ sfxSetViewportHook(void *dev, void *vp)
 				sfxProjRemapped = 1;
 			}
 		}
-		sfxLogEvent('V', sfxProjRemapped);
+		sfxLogLine("%c vp=%ux%u remapped=%d\n",
+			sfxViewportOverRaster(v) ? 'V' : 'v',
+			v->width, v->height, (int)sfxProjRemapped);
 	}
 	return hr;
 }
@@ -1653,39 +1660,52 @@ sfxScaleInstallVtableHook(void)
 	// the vtable is the FIRST member of the device object; the object
 	// itself must never be written (earlier revisions corrupted it)
 	void **vt = (void**)(*(void**)d3d9device);
-	if(vt == nil)
+	sfxLogLine("install: dev=%08x vt=%08x\n",
+		(unsigned int)(void*)d3d9device, (unsigned int)vt);
+	if(vt == nil){
+		sfxScaleVtTried = 1;
 		return;
+	}
 	d3dSetViewportOrig = (sfxD3D2ArgFn)vt[8];
 	d3dGetViewport = (sfxD3D2ArgFn)vt[9];
 	d3dSetTransformOrig = (sfxD3D3ArgFn)vt[15];
 	d3dGetTransform = (sfxD3D3ArgFn)vt[16];
-	// sanity check: the saved "original" methods must be code inside the
-	// d3d9 module (guards against an unexpected object layout)
-	HMODULE hD3D9 = GetModuleHandle("d3d9.dll");
-	if(hD3D9 == nil)
-		return;
-	IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER*)hD3D9;
-	IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS*)((char*)hD3D9 + dos->e_lfanew);
-	int lo = (int)hD3D9;
-	int hi = (int)hD3D9 + (int)nt->OptionalHeader.SizeOfImage;
-	if((int)(void*)d3dSetViewportOrig < lo || (int)(void*)d3dSetViewportOrig >= hi
-		|| (int)(void*)d3dSetTransformOrig < lo || (int)(void*)d3dSetTransformOrig >= hi){
+	sfxLogLine("install: orig slot8=%08x slot9=%08x slot15=%08x slot16=%08x\n",
+		(unsigned int)(void*)d3dSetViewportOrig, (unsigned int)(void*)d3dGetViewport,
+		(unsigned int)(void*)d3dSetTransformOrig, (unsigned int)(void*)d3dGetTransform);
+	// plausibility check: the "original" methods must be normal 32-bit
+	// code pointers. No module is assumed here: a d3d9-on-d12 style
+	// wrapper may implement the device in a different module.
+	if((unsigned int)(void*)d3dSetViewportOrig < 0x10000
+		|| (unsigned int)(void*)d3dSetViewportOrig >= 0x80000000
+		|| (unsigned int)(void*)d3dSetTransformOrig < 0x10000
+		|| (unsigned int)(void*)d3dSetTransformOrig >= 0x80000000){
+		sfxLogLine("install: ABORT - original pointers not plausible\n");
 		sfxScaleVtTried = 1;
 		return;
 	}
-	// the vtable lives in the module's read-only section, so the page has
-	// to be made writable just for the patch and restored afterwards; if
-	// any of this fails, leave the hooks disabled: renderScale then
-	// degrades to the zoomed crop instead of crashing
+	// the vtable lives in a read-only section, so its page has to be
+	// made writable just for the patch and restored afterwards
 	size_t span = (size_t)((char*)&vt[16] - (char*)&vt[8]);
 	DWORD oldProt = 0;
 	if(!VirtualProtect(&vt[8], span, PAGE_READWRITE, &oldProt)){
+		sfxLogLine("install: ABORT - VirtualProtect failed (err=%u)\n",
+			(unsigned int)GetLastError());
 		sfxScaleVtTried = 1;
 		return;
 	}
 	Patch((void*)(&vt[15]), (void*)sfxSetTransformHook);
 	Patch((void*)(&vt[8]), (void*)sfxSetViewportHook);
 	VirtualProtect(&vt[8], span, oldProt, &oldProt);
+	// verify the entries really took (read them back through the table)
+	if(vt[15] != (void*)sfxSetTransformHook || vt[8] != (void*)sfxSetViewportHook){
+		sfxLogLine("install: ABORT - readback mismatch slot8=%08x slot15=%08x\n",
+			(unsigned int)(void*)vt[8], (unsigned int)(void*)vt[15]);
+		sfxScaleVtTried = 1;
+		return;
+	}
+	sfxLogLine("install: OK - vtable hooked slot8=%08x slot15=%08x\n",
+		(unsigned int)(void*)sfxSetViewportHook, (unsigned int)(void*)sfxSetTransformHook);
 	sfxScaleVtPatched = 1;
 	sfxScaleVtTried = 1;
 }
@@ -1741,6 +1761,7 @@ RenderScale_Begin(void)
 	sfxScaleInstallVtableHook();
 	sfxScaleS = s;
 	sfxScaleActive = 1;
+	sfxLogLine("B begin: scale=%.2f raster=%dx%d\n", sfxScaleS, w, h);
 }
 
 // Called from RenderScene_after() once the 3D scene pass is done: the
