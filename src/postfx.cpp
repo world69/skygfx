@@ -1414,33 +1414,47 @@ setSceneRaster(RwRaster *r)
 	RwCameraBeginUpdate(Scene.camera);
 }
 
-// dither pattern: one 8x8 blue noise tile per 8x8 screen pixels, so sampling
-// the raster with screen-space UVs gives per-pixel noise without any extra
-// constants or texture transforms
+// forward decl - the diagnostics helper lives further down in this file
+static void sfxLogLine(const char *fmt, ...);
+
+// dither pattern: the 8x8 blue-noise tile is written per SCREEN PIXEL into a
+// full-size raster, so sampling it with the quad's 0..1 screen-space UVs
+// gives one noise texel per pixel - per-pixel dithering like the PS2
+// framebuffer. An earlier version stored the tile in a w/8 x h/8 raster
+// instead: every texel then covered a flat 8x8-pixel block and the tile
+// repeated every 64 pixels - big regular blotches all over the screen.
 static bool
 ensureDitherTexture(int w, int h)
 {
-	int dw = (w + 7) / 8;
-	int dh = (h + 7) / 8;
 	if(ditherRaster && ditherLastW == w && ditherLastH == h)
 		return true;
 	if(!ditherTexture)
 		ditherTexture = RwTextureCreate(nil);
 	if(ditherRaster) RwRasterDestroy(ditherRaster);
-	ditherRaster = RwRasterCreate(dw, dh, 32, rwRASTERTYPECAMERATEXTURE);
-	if(!ditherRaster)
+	ditherRaster = RwRasterCreate(w, h, 32, rwRASTERTYPECAMERATEXTURE);
+	if(!ditherRaster){
+		sfxLogLine("D dither: FAIL create %dx%d\n", w, h);
 		return false;
+	}
 	uint8 noise[64];
 	makeBlueNoise8x8(noise);
 	RwUInt8 *pixels = RwRasterLock(ditherRaster, 0, 1);
-	for(int y = 0; y < dh; y++)
-		for(int x = 0; x < dw; x++){
+	RwUInt8 *start = pixels;
+	for(int y = 0; y < h; y++)
+		for(int x = 0; x < w; x++){
 			uint8 v = noise[(y & 7) * 8 + (x & 7)];
 			*pixels++ = v;
 			*pixels++ = v;
 			*pixels++ = v;
 			*pixels++ = 0xFF;
 		}
+	sfxLogLine("D dither: raster %dx%d per-pixel\n", w, h);
+	sfxLogLine("D dither: tile row0 %02x %02x %02x %02x %02x %02x %02x %02x\n",
+		noise[0], noise[1], noise[2], noise[3],
+		noise[4], noise[5], noise[6], noise[7]);
+	sfxLogLine("D dither: raster row0 %02x %02x %02x %02x %02x %02x %02x %02x\n",
+		start[0], start[4], start[8], start[12],
+		start[16], start[20], start[24], start[28]);
 	RwRasterUnlock(ditherRaster);
 	RwTextureSetRaster(ditherTexture, ditherRaster);
 	ditherLastW = w;
@@ -1592,7 +1606,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.5) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.6) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
