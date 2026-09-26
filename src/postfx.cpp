@@ -1543,6 +1543,13 @@ struct SfxD3DViewport
 }; // D3DVIEWPORT9 is 24 bytes - GetViewport() writes all of it
 static struct SfxD3DViewport sfxVpFull;
 
+// scratch for the upscale: the camera raster is the back buffer and can NOT
+// be sampled as a texture (v9.1 sampled it and every sample came back
+// white), so the frame is copied here 1:1 first and the scaled rectangle is
+// stretched from here into the front buffer
+static RwRaster *sfxStretchRaster;
+static int sfxStretchW, sfxStretchH, sfxStretchDepth;
+
 // D3D9 device vtable slots (IDirect3DDevice9 layout, d3d9.h order:
 // ... EndScene=42, Clear=43, then):
 //   44 = SetTransform(int type, const D3DMATRIX *)
@@ -1586,7 +1593,7 @@ sfxLogLine(const char *fmt, ...)
 		sfxLog = fopen("skygfx_renderScale.log", "a");
 		if(sfxLog == nil)
 			return;
-		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.1) ====\n");
+		fprintf(sfxLog, "==== skygfx renderScale diagnostics (build v9.2) ====\n");
 	}
 	va_list ap;
 	va_start(ap, fmt);
@@ -1772,6 +1779,25 @@ RenderScale_EndOfScene(void)
 	sfxScaleActive = 0;
 }
 
+// full-size scratch raster for the stretch pass (same recipe as the bloom
+// buffers: recreate when the size or depth of the front buffer changes)
+static RwRaster *
+ensureStretchRaster(int w, int h, RwInt32 depth)
+{
+	if(sfxStretchRaster && sfxStretchW == w && sfxStretchH == h
+			&& sfxStretchDepth == depth)
+		return sfxStretchRaster;
+	if(sfxStretchRaster)
+		RwRasterDestroy(sfxStretchRaster);
+	sfxStretchRaster = RwRasterCreate(w, h, depth, rwRASTERTYPECAMERATEXTURE);
+	if(!sfxStretchRaster)
+		return nil;
+	sfxStretchW = w;
+	sfxStretchH = h;
+	sfxStretchDepth = depth;
+	return sfxStretchRaster;
+}
+
 void
 CPostEffects::DrawFinalEffects(void)
 {
@@ -1817,49 +1843,61 @@ CPostEffects::DrawFinalEffects(void)
 		return;
 
 	// scene, after all game post effects, into the front buffer
+	bool stretched = false;
 	if(scaled){
 		// the scene lives in the top-left sfxScaleW x sfxScaleH of the full
 		// raster (scaled viewport) - stretch exactly that rectangle. First
-		// take the full-size viewport back: this quad and the final
+		// take the full-size viewport back: this pass and the final
 		// composite below cover the whole raster
 		if(sfxVpScaled && sfxVpFull.width != 0 && d3dSetViewportOrig){
 			d3dSetViewportOrig(d3d9device, &sfxVpFull);
 			sfxVpScaled = 0;
 			sfxLogLine("F vp restored %ux%u\n", sfxVpFull.width, sfxVpFull.height);
 		}
-		// like UpdateFrontBuffer(), but with a textured quad whose UVs stop
-		// at the scaled rectangle instead of a 1:1 RwRasterRenderFast blit.
-		// RwIm2DRenderIndexedPrimitive needs a camera in update (RW keeps
-		// per-camera state the immediate-mode renderer reads - drawing with
-		// no camera context crashed in rwD3D9Im2DRenderIndexedPrimitive at
-		// +0x1a, NULL+0x60), so point the camera at the front buffer for the
-		// quad, exactly the way setSceneRaster/bloom switch targets, and
-		// point it back afterwards
-		static RwIm2DVertex sv[4];
-		float nearscreen = RwIm2DGetNearScreenZ();
-		float nearcam = RwCameraGetNearClipPlane(Scene.camera);
-		float recipz = 1.0f/nearcam;
-		float uw = sfxScaleW / (float)drawBuffer->width;
-		float vh = sfxScaleH / (float)drawBuffer->height;
-		quadSetUV(sv, 0.0f, 0.0f, uw, vh);
-		quadSetXY(sv, 0.0f, 0.0f, (float)w, (float)h);
-		for(int i = 0; i < 4; i++){
-			RwIm2DVertexSetScreenZ(&sv[i], nearscreen);
-			RwIm2DVertexSetCameraZ(&sv[i], nearcam);
-			RwIm2DVertexSetRecipCameraZ(&sv[i], recipz);
-			RwIm2DVertexSetIntRGBA(&sv[i], 255, 255, 255, 255);
+		// The camera raster is the back buffer and can NOT be sampled as a
+		// texture - v9.1 tried and every sample came back white (vignette
+		// over plain white = the grey frame that was reported). So copy it
+		// into a scratch raster 1:1 first (exactly what UpdateFrontBuffer
+		// does), then stretch the scratch's top-left scaled rectangle into
+		// pRasterFrontBuffer with a textured quad. The quad draws with a
+		// camera in update (Im2D needs the camera context - the v9 crash)
+		// and reads the scratch, never the camera raster.
+		RwRaster *scratch = ensureStretchRaster(w, h, pRasterFrontBuffer->depth);
+		if(scratch != nil){
+			RwCameraEndUpdate(Scene.camera);
+			RwRasterPushContext(scratch);
+			RwRasterRenderFast(drawBuffer, 0, 0);
+			RwRasterPopContext();
+			RwCameraBeginUpdate(Scene.camera);
+			static RwIm2DVertex sv[4];
+			float nearscreen = RwIm2DGetNearScreenZ();
+			float nearcam = RwCameraGetNearClipPlane(Scene.camera);
+			float recipz = 1.0f/nearcam;
+			float uw = sfxScaleW / (float)drawBuffer->width;
+			float vh = sfxScaleH / (float)drawBuffer->height;
+			quadSetUV(sv, 0.0f, 0.0f, uw, vh);
+			quadSetXY(sv, 0.0f, 0.0f, (float)w, (float)h);
+			for(int i = 0; i < 4; i++){
+				RwIm2DVertexSetScreenZ(&sv[i], nearscreen);
+				RwIm2DVertexSetCameraZ(&sv[i], nearcam);
+				RwIm2DVertexSetRecipCameraZ(&sv[i], recipz);
+				RwIm2DVertexSetIntRGBA(&sv[i], 255, 255, 255, 255);
+			}
+			setSceneRaster(pRasterFrontBuffer);
+			RwRenderStateSet(rwRENDERSTATETEXTUREFILTER, (void*)rwFILTERLINEAR);
+			RwRenderStateSet(rwRENDERSTATEFOGENABLE, (void*)FALSE);
+			RwRenderStateSet(rwRENDERSTATEZTESTENABLE, (void*)FALSE);
+			RwRenderStateSet(rwRENDERSTATEZWRITEENABLE, (void*)FALSE);
+			RwRenderStateSet(rwRENDERSTATEVERTEXALPHAENABLE, (void*)FALSE);
+			RwD3D9SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+			RwRenderStateSet(rwRENDERSTATETEXTURERASTER, (void*)scratch);
+			RwIm2DRenderIndexedPrimitive(rwPRIMTYPETRILIST, sv, 4, colorfilterIndices, 6);
+			setSceneRaster(drawBuffer);
+			sfxLogLine("F2 stretch %ux%u -> %dx%d\n", sfxScaleW, sfxScaleH, w, h);
+			stretched = true;
 		}
-		setSceneRaster(pRasterFrontBuffer);
-		RwRenderStateSet(rwRENDERSTATETEXTUREFILTER, (void*)rwFILTERLINEAR);
-		RwRenderStateSet(rwRENDERSTATEFOGENABLE, (void*)FALSE);
-		RwRenderStateSet(rwRENDERSTATEZTESTENABLE, (void*)FALSE);
-		RwRenderStateSet(rwRENDERSTATEZWRITEENABLE, (void*)FALSE);
-		RwRenderStateSet(rwRENDERSTATEVERTEXALPHAENABLE, (void*)FALSE);
-		RwD3D9SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
-		RwRenderStateSet(rwRENDERSTATETEXTURERASTER, (void*)drawBuffer);
-		RwIm2DRenderIndexedPrimitive(rwPRIMTYPETRILIST, sv, 4, colorfilterIndices, 6);
-		setSceneRaster(drawBuffer);
-	}else
+	}
+	if(!stretched)
 		UpdateFrontBuffer();
 
 	RwRenderStateSet(rwRENDERSTATETEXTUREFILTER, (void*)rwFILTERLINEAR);
